@@ -1,18 +1,10 @@
-import pyaudio
 from pocketsphinx import LiveSpeech
 
-print("🔊 Listening for wake word... (say 'assistant')")
+# Create a LiveSpeech object listening for the word "hello"
+speech = LiveSpeech(lm=False, keyphrase='hello', kws_threshold=1e-20)
 
-speech = LiveSpeech(
-    verbose=False,
-    sampling_rate=16000,
-    buffer_size=2048,
-    no_search=False,
-    full_utt=False,
-    keyphrase='assistant',  # your chosen wake word
-    kws_threshold=1e-20     # lower = more sensitive
-)
+print("Listening for the wake word 'hello'...")
 
+# Infinite loop listening for wake word
 for phrase in speech:
-    print("🟢 Wake word detected!")
-    # Now you could record audio and send to your API
+    print("Wake word detected:", phrase)
