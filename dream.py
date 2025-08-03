@@ -8,7 +8,9 @@ import queue
 import time
 
 # === CONFIG ===
-WAKE_WORD = 'dream'
+ACCESS_KEY = "YOUR_ACCESS_KEY_HERE"
+WAKE_WORD = "dream"  # or any built-in word
+
 AUDIO_FILENAME = 'wake_audio.wav'
 UPLOAD_URL = 'http://localhost:5000/upload'
 # === AUDIO SETTINGS ===
@@ -18,7 +20,10 @@ CHUNK = 512
 QUEUE = queue.Queue()
 
 # === WAKE WORD ===
-porcupine = pvporcupine.create(keywords=[WAKE_WORD])
+porcupine = pvporcupine.create(
+    access_key=ACCESS_KEY,
+    keywords=[WAKE_WORD]
+)
 pa = pyaudio.PyAudio()
 stream = pa.open(
     rate=porcupine.sample_rate,
