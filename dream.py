@@ -1,46 +1,82 @@
-import sounddevice as sd
-import vosk
-import queue
-import json
+import pvporcupine
+import pyaudio
+import struct
+import wave
 import requests
-import pyttsx3
+import threading
+import queue
+import time
 
-q = queue.Queue()
-model = vosk.Model("model")
+# === CONFIG ===
+WAKE_WORD = 'dream'
+AUDIO_FILENAME = 'wake_audio.wav'
+UPLOAD_URL = 'https://your-mcp-server.com/upload'
+CHANNELS = 1
+RATE = 16000
+CHUNK = 512
+QUEUE = queue.Queue()
 
-def audio_callback(indata, frames, time, status):
-    if status:
-        print(status)
-    q.put(bytes(indata))
+# === WAKE WORD ===
+porcupine = pvporcupine.create(keyword_paths=[pvporcupine.KEYWORDS[WAKE_WORD]])
+pa = pyaudio.PyAudio()
+stream = pa.open(
+    rate=porcupine.sample_rate,
+    channels=1,
+    format=pyaudio.paInt16,
+    input=True,
+    frames_per_buffer=porcupine.frame_length,
+)
 
-def listen_and_transcribe():
-    with sd.RawInputStream(samplerate=16000, blocksize=8000, dtype='int16',
-                           channels=1, callback=audio_callback):
-        print("Listening for speech...")
-        rec = vosk.KaldiRecognizer(model, 16000)
-        while True:
-            data = q.get()
-            if rec.AcceptWaveform(data):
-                result = json.loads(rec.Result())
-                return result.get("text", "")
+def save_audio(filename, record_seconds=5):
+    wf = wave.open(filename, 'wb')
+    wf.setnchannels(CHANNELS)
+    wf.setsampwidth(pa.get_sample_size(pyaudio.paInt16))
+    wf.setframerate(RATE)
+    
+    stream = pa.open(format=pyaudio.paInt16, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
+    frames = []
+    
+    for _ in range(int(RATE / CHUNK * record_seconds)):
+        data = stream.read(CHUNK)
+        frames.append(data)
+    
+    stream.stop_stream()
+    stream.close()
+    
+    wf.writeframes(b''.join(frames))
+    wf.close()
 
-def query_llm(text):
-    url = "https://your-api.com/ask"
-    response = requests.post(url, json={"query": text})
-    if response.ok:
-        return response.json().get("response", "")
-    return "Sorry, I couldn’t reach the assistant."
+def upload_worker():
+    while True:
+        file_to_upload = QUEUE.get()
+        try:
+            with open(file_to_upload, 'rb') as f:
+                response = requests.post(UPLOAD_URL, files={'file': f})
+            print(f'Uploaded: {file_to_upload}, Status: {response.status_code}')
+        except Exception as e:
+            print(f'Upload failed: {e}')
+            QUEUE.put(file_to_upload)  # Retry
+        QUEUE.task_done()
+        time.sleep(2)
 
-def speak(text):
-    engine = pyttsx3.init()
-    engine.say(text)
-    engine.runAndWait()
+threading.Thread(target=upload_worker, daemon=True).start()
 
-# Main loop
-while True:
-    transcript = listen_and_transcribe()
-    if transcript:
-        print("You said:", transcript)
-        # response = query_llm(transcript)
-        # print("Assistant:", response)
-        speak(transcript)
+print("Listening for wake word...")
+
+try:
+    while True:
+        pcm = stream.read(porcupine.frame_length)
+        pcm = struct.unpack_from("h" * porcupine.frame_length, pcm)
+
+        keyword_index = porcupine.process(pcm)
+        if keyword_index >= 0:
+            print("Wake word detected!")
+            save_audio(AUDIO_FILENAME)
+            QUEUE.put(AUDIO_FILENAME)
+except KeyboardInterrupt:
+    pass
+finally:
+    stream.stop_stream()
+    stream.close()
+    pa.terminate()
+    porcupine.delete()
