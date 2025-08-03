@@ -18,7 +18,7 @@ CHUNK = 512
 QUEUE = queue.Queue()
 
 # === WAKE WORD ===
-porcupine = pvporcupine.create(keyword_paths=[pvporcupine.KEYWORDS[WAKE_WORD]])
+porcupine = pvporcupine.create(keywords=[WAKE_WORD])
 pa = pyaudio.PyAudio()
 stream = pa.open(
     rate=porcupine.sample_rate,
