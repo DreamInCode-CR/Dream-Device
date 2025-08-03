@@ -10,7 +10,8 @@ import time
 # === CONFIG ===
 WAKE_WORD = 'dream'
 AUDIO_FILENAME = 'wake_audio.wav'
-UPLOAD_URL = 'https://your-mcp-server.com/upload'
+UPLOAD_URL = 'http://localhost:5000/upload'
+# === AUDIO SETTINGS ===
 CHANNELS = 1
 RATE = 16000
 CHUNK = 512
