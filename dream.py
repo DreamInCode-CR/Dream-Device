@@ -9,7 +9,7 @@ import time
 
 # === CONFIG ===
 ACCESS_KEY = "YOUR_ACCESS_KEY_HERE"
-WAKE_WORD = "dream"  # or any built-in word
+WAKE_WORD = "porcupine"  # or any built-in word
 
 AUDIO_FILENAME = 'wake_audio.wav'
 UPLOAD_URL = 'http://localhost:5000/upload'
