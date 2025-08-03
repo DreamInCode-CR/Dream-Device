@@ -8,7 +8,7 @@ import queue
 import time
 
 # === CONFIG ===
-ACCESS_KEY = "YOUR_ACCESS_KEY_HERE"
+ACCESS_KEY = "heQRVcJzahp/QdflX+KJRkOr6yvkclzaAKK6fY1NEKdYwtowZocbOg=="
 WAKE_WORD = "porcupine"  # or any built-in word
 
 AUDIO_FILENAME = 'wake_audio.wav'
