@@ -1,4 +1,3 @@
-
 import pvporcupine
 import pyaudio
 import struct
@@ -14,8 +13,9 @@ from datetime import datetime
 # === CONFIG ===
 ACCESS_KEY = "heQRVcJzahp/QdflX+KJRkOr6yvkclzaAKK6fY1NEKdYwtowZocbOg=="
 WAKE_WORD = "porcupine"
-VOICE_MCP_URL = "https://dreamincode-abgjgwgfckbqergq.eastus-01.azurewebsites.net/voice_mcp"  # Single endpoint
+VOICE_MCP_URL = "https://dreamincode-abgjgwgfckbqergq.eastus-01.azurewebsites.net/voice_mcp"
 
+USER_ID = 3   # <--- assign elderly user ID here
 CHANNELS = 1
 RATE = 16000
 RECORD_SECONDS = 5
@@ -70,7 +70,7 @@ def mcp_worker():
                 response = requests.post(
                     VOICE_MCP_URL,
                     files={'audio': (file_to_upload, f, 'audio/wav')},
-                    data={"usuario_id": 3, "lang": "es"},  # optional form fields
+                    data={"usuario_id": USER_ID, "lang": "es"},  # <--- USER_ID used here
                     timeout=60
                 )
 
@@ -106,17 +106,13 @@ def reminder_scheduler():
                 print(f"[REMINDER] Time to take {med['name']}")
                 reminder_file = "reminder.wav"
 
-                # Ask MCP to generate reminder speech
                 response = requests.post(
                     VOICE_MCP_URL,
-                    data={"lang": "en", "return": "json"},  # force text only first?
+                    data={"usuario_id": USER_ID, "lang": "en"},  # <--- USER_ID used here too
                     files={'audio': ("reminder.wav", b"", 'audio/wav')}
                 )
 
-                # Simple local fallback if MCP can't generate
                 if response.status_code == 200:
-                    # NOTE: since /voice_mcp requires audio, we might instead send a dummy file
-                    # and encode text-to-speech via DB in backend. Adjust as needed.
                     with open(reminder_file, "wb") as f:
                         f.write(response.content)
                     play_audio(reminder_file)
