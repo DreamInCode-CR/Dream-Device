@@ -1,3 +1,4 @@
+
 import pvporcupine
 import pyaudio
 import struct
@@ -13,15 +14,14 @@ from datetime import datetime
 # === CONFIG ===
 ACCESS_KEY = "heQRVcJzahp/QdflX+KJRkOr6yvkclzaAKK6fY1NEKdYwtowZocbOg=="
 WAKE_WORD = "porcupine"
-UPLOAD_URL = "http://localhost:5000/upload"
-TTS_URL = "http://localhost:5000/tts"  # Where MCP sends back audio
-AUDIO_FILENAME = "wake_audio.wav"
+VOICE_MCP_URL = "https://dreamincode-abgjgwgfckbqergq.eastus-01.azurewebsites.net/voice_mcp"  # Single endpoint
+
 CHANNELS = 1
 RATE = 16000
 RECORD_SECONDS = 5
 QUEUE = queue.Queue()
 
-# Medicine schedule: hour/minute and medicine name
+# Medicine schedule
 MEDICATIONS = [
     {"hour": 8, "minute": 0, "name": "blood pressure pill"},
     {"hour": 20, "minute": 0, "name": "cholesterol tablet"}
@@ -47,7 +47,7 @@ stream = pa.open(
     frames_per_buffer=porcupine.frame_length
 )
 
-# Pre-buffer for 1 sec before trigger
+# Pre-buffer 1 sec before trigger
 pre_buffer_frames = deque(maxlen=int(RATE / porcupine.frame_length * 1))
 
 def save_audio_from_frames(filename, frames):
@@ -60,66 +60,74 @@ def save_audio_from_frames(filename, frames):
 def play_audio(filename):
     os.system(f"aplay {filename} >/dev/null 2>&1")
 
-def upload_worker():
-    """Uploads recorded audio to MCP and plays TTS response."""
+def mcp_worker():
+    """Worker: sends audio to MCP endpoint and plays response."""
     global state, last_activity_time
     while True:
         file_to_upload, expect_followup = QUEUE.get()
         try:
-            # Send audio to MCP
             with open(file_to_upload, 'rb') as f:
-                response = requests.post(UPLOAD_URL, files={'file': f}, timeout=20)
+                response = requests.post(
+                    VOICE_MCP_URL,
+                    files={'audio': (file_to_upload, f, 'audio/wav')},
+                    data={"usuario_id": 3, "lang": "es"},  # optional form fields
+                    timeout=60
+                )
 
             if response.status_code == 200:
-                print(f"[UPLOAD] {file_to_upload} sent.")
+                out_file = "respuesta.wav"
+                with open(out_file, "wb") as f:
+                    f.write(response.content)
 
-                # Get TTS response from MCP
-                r_tts = requests.get(TTS_URL, timeout=30)
-                if r_tts.status_code == 200:
-                    tts_file = "response.wav"
-                    with open(tts_file, 'wb') as f:
-                        f.write(r_tts.content)
-                    play_audio(tts_file)
-                    os.remove(tts_file)
+                print("[MCP] Got response audio, playing...")
+                play_audio(out_file)
+                os.remove(out_file)
 
-                    if expect_followup:
-                        state = CONVERSATION_ACTIVE
-                        last_activity_time = time.time()
-                    else:
-                        state = IDLE
+                if expect_followup:
+                    state = CONVERSATION_ACTIVE
+                    last_activity_time = time.time()
                 else:
-                    print("[ERROR] No TTS received.")
+                    state = IDLE
             else:
-                print("[ERROR] MCP rejected file.")
+                print(f"[MCP ERROR] Status: {response.status_code}")
         except Exception as e:
-            print(f"[UPLOAD ERROR] {e}")
+            print(f"[MCP ERROR] {e}")
 
         os.remove(file_to_upload)
         QUEUE.task_done()
 
 def reminder_scheduler():
-    """Checks medication times and triggers reminders."""
+    """Medication reminders thread."""
     global state
     while True:
         now = datetime.now()
         for med in MEDICATIONS:
             if now.hour == med["hour"] and now.minute == med["minute"]:
-                reminder_text = f"It's time to take your {med['name']}. Have you taken it yet?"
-                print("[REMINDER]", reminder_text)
-                # Save as TTS request to MCP (simulate TTS here)
-                tts_file = "reminder.wav"
-                # Assume MCP can generate this directly from text
-                r_tts = requests.post(TTS_URL, data={"text": reminder_text})
-                if r_tts.status_code == 200:
-                    with open(tts_file, 'wb') as f:
-                        f.write(r_tts.content)
-                    play_audio(tts_file)
-                    os.remove(tts_file)
+                print(f"[REMINDER] Time to take {med['name']}")
+                reminder_file = "reminder.wav"
+
+                # Ask MCP to generate reminder speech
+                response = requests.post(
+                    VOICE_MCP_URL,
+                    data={"lang": "en", "return": "json"},  # force text only first?
+                    files={'audio': ("reminder.wav", b"", 'audio/wav')}
+                )
+
+                # Simple local fallback if MCP can't generate
+                if response.status_code == 200:
+                    # NOTE: since /voice_mcp requires audio, we might instead send a dummy file
+                    # and encode text-to-speech via DB in backend. Adjust as needed.
+                    with open(reminder_file, "wb") as f:
+                        f.write(response.content)
+                    play_audio(reminder_file)
+                    os.remove(reminder_file)
+
                 state = WAITING_FOR_CONFIRMATION
         time.sleep(60)
 
-threading.Thread(target=upload_worker, daemon=True).start()
-threading.Thread(target=reminder_scheduler, daemon=True).start()
+# Start threads
+threading.Thread(target=mcp_worker, daemon=True).start()
+# threading.Thread(target=reminder_scheduler, daemon=True).start()
 
 print("Listening for wake word...")
 
@@ -141,20 +149,18 @@ try:
                 frames = list(pre_buffer_frames)
                 for _ in range(int(RATE / porcupine.frame_length * RECORD_SECONDS)):
                     frames.append(stream.read(porcupine.frame_length, exception_on_overflow=False))
-                save_audio_from_frames(AUDIO_FILENAME, frames)
-                QUEUE.put((AUDIO_FILENAME, True))
+                save_audio_from_frames("wake_audio.wav", frames)
+                QUEUE.put(("wake_audio.wav", True))
 
         elif state in (CONVERSATION_ACTIVE, WAITING_FOR_CONFIRMATION):
-            # Simple follow-up speech detection by timing
             if time.time() - last_activity_time > 10:
                 state = IDLE
             else:
-                # If voice detected, record & send
                 frames = []
                 for _ in range(int(RATE / porcupine.frame_length * RECORD_SECONDS)):
                     frames.append(stream.read(porcupine.frame_length, exception_on_overflow=False))
-                save_audio_from_frames(AUDIO_FILENAME, frames)
-                QUEUE.put((AUDIO_FILENAME, True))
+                save_audio_from_frames("followup.wav", frames)
+                QUEUE.put(("followup.wav", True))
                 last_activity_time = time.time()
 
 except KeyboardInterrupt:
