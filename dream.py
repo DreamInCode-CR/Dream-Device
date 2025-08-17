@@ -10,6 +10,20 @@ import os
 from collections import deque
 from datetime import datetime
 
+# === NUEVO: imports para la conversión MP3->WAV (si llega MP3) ===
+from pydub import AudioSegment
+import io
+import tempfile
+
+# (opcional) asegura que pydub use ffmpeg del PATH
+os.environ.setdefault("FFMPEG_BINARY", "ffmpeg")
+try:
+    # En muchas Raspberry Pi, ffmpeg está en /usr/bin/ffmpeg
+    if os.path.exists("/usr/bin/ffmpeg"):
+        AudioSegment.converter = "/usr/bin/ffmpeg"
+except Exception:
+    pass
+
 # === CONFIG ===
 ACCESS_KEY = "heQRVcJzahp/QdflX+KJRkOr6yvkclzaAKK6fY1NEKdYwtowZocbOg=="
 WAKE_WORD = "porcupine"
@@ -60,6 +74,38 @@ def save_audio_from_frames(filename, frames):
 def play_audio(filename):
     os.system(f"aplay {filename} >/dev/null 2>&1")
 
+# === NUEVO: helper para reproducir SIEMPRE WAV, convirtiendo si hace falta ===
+def play_response_bytes_as_wav(resp_bytes: bytes, content_type: str | None):
+    """
+    Reproduce la respuesta del backend como WAV.
+    - Si el Content-Type indica WAV, reproduce directo.
+    - Si indica MP3 (o no indica nada), convierte a WAV con pydub/ffmpeg y reproduce.
+    """
+    ct = (content_type or "").lower()
+    tmp_path = None
+    try:
+        if "wav" in ct:
+            # Ya es WAV
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp.write(resp_bytes)
+                tmp_path = tmp.name
+        else:
+            # Asumimos MP3 u otro formato -> convertir a WAV
+            # Si no hay CT, intentamos mp3 por defecto
+            assumed_format = "mp3" if ("mp3" in ct or ct == "" or "mpeg" in ct) else "mp3"
+            audio = AudioSegment.from_file(io.BytesIO(resp_bytes), format=assumed_format)
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                audio.export(tmp.name, format="wav")
+                tmp_path = tmp.name
+
+        play_audio(tmp_path)
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
 def mcp_worker():
     """Worker: sends audio to MCP endpoint and plays response."""
     global state, last_activity_time
@@ -75,13 +121,10 @@ def mcp_worker():
                 )
 
             if response.status_code == 200:
-                out_file = "respuesta.wav"
-                with open(out_file, "wb") as f:
-                    f.write(response.content)
-
-                print("[MCP] Got response audio, playing...")
-                play_audio(out_file)
-                os.remove(out_file)
+                # === CAMBIO: en lugar de guardar a disco y reproducir "respuesta.wav",
+                # usamos el helper que convierte a WAV si hace falta y reproduce.
+                play_response_bytes_as_wav(response.content, response.headers.get("Content-Type"))
+                print("[MCP] Got response audio, played.")
 
                 if expect_followup:
                     state = CONVERSATION_ACTIVE
@@ -93,7 +136,10 @@ def mcp_worker():
         except Exception as e:
             print(f"[MCP ERROR] {e}")
 
-        os.remove(file_to_upload)
+        try:
+            os.remove(file_to_upload)
+        except Exception:
+            pass
         QUEUE.task_done()
 
 def reminder_scheduler():
