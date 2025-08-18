@@ -15,6 +15,7 @@ import requests
 # === Audio decode / convert ===
 from pydub import AudioSegment
 import tempfile
+import subprocess  # <-- añadido para reproducir audio de espera en loop
 
 # -----------------------------------------------------------------------------
 # Configuración
@@ -32,13 +33,16 @@ RATE = 16000
 RECORD_SECONDS = 5
 QUEUE = queue.Queue()
 
+# Audio local de espera (se reproduce en loop mientras esperamos respuesta del servidor)
+WAIT_AUDIO_PATH = os.path.expanduser("~/esperaRespuesta.wav")  # <-- ajusta la ruta si lo guardas en otro lado
+
 # Mediciones de tiempo
 last_rec_started_at = 0.0
 
 # Agenda de ejemplo (no usada si el thread está comentado)
 MEDICATIONS = [
     {"hour": 8, "minute": 0, "name": "blood pressure pill"},
-    {"hour": 16, "minute": 0, "name": "cholesterol tablet"},
+    {"hour": 20, "minute": 0, "name": "cholesterol tablet"},
 ]
 
 # Estados
@@ -151,6 +155,46 @@ def play_response_bytes_as_wav(resp_bytes: bytes, content_type: str):
                 pass
 
 # -----------------------------------------------------------------------------
+# Audio de espera (loop hasta que llegue la respuesta del servidor)
+# -----------------------------------------------------------------------------
+
+def start_wait_loop(file_path: str) -> threading.Event | None:
+    """
+    Reproduce file_path en loop con 'aplay' hasta que returns_stop_event.set() sea llamado.
+    Devuelve el Event para parar. Si no existe el archivo, devuelve None.
+    """
+    if not os.path.exists(file_path):
+        print(f"[WAIT] archivo no encontrado: {file_path}")
+        return None
+
+    stop = threading.Event()
+
+    def _loop():
+        while not stop.is_set():
+            try:
+                p = subprocess.Popen(
+                    ["aplay", "-q", file_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                # Espera no bloqueante con posibilidad de cortar
+                while p.poll() is None:
+                    if stop.is_set():
+                        try:
+                            p.terminate()
+                        except Exception:
+                            pass
+                        break
+                    time.sleep(0.1)
+            except Exception as e:
+                print(f"[WAIT] error reproduciendo: {e}")
+                break
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    return stop
+
+# -----------------------------------------------------------------------------
 # Worker: envía audio al backend y reproduce la respuesta
 # -----------------------------------------------------------------------------
 
@@ -158,7 +202,12 @@ def mcp_worker():
     global state, last_activity_time
     while True:
         file_to_upload, expect_followup = QUEUE.get()
+        wait_stop = None
         try:
+            # Arranca el audio de espera si existe
+            if os.path.exists(WAIT_AUDIO_PATH):
+                wait_stop = start_wait_loop(WAIT_AUDIO_PATH)
+
             with open(file_to_upload, 'rb') as f:
                 t0 = time.time()
                 response = requests.post(
@@ -168,6 +217,10 @@ def mcp_worker():
                     timeout=60
                 )
                 rt = time.time() - t0
+
+            # Detener audio de espera en cuanto llega respuesta
+            if wait_stop:
+                wait_stop.set()
 
             if response.status_code == 200:
                 print(f"[NET] round-trip {rt:.2f}s, content-type={response.headers.get('Content-Type')}")
@@ -183,6 +236,9 @@ def mcp_worker():
                 print(f"[MCP ERROR] Status: {response.status_code}")
         except Exception as e:
             print(f"[MCP ERROR] {e}")
+            # Asegurar detener audio de espera si hubo error
+            if wait_stop:
+                wait_stop.set()
         finally:
             try:
                 os.remove(file_to_upload)
@@ -201,8 +257,8 @@ def reminder_scheduler():
         now = datetime.now()
         for med in MEDICATIONS:
             if now.hour == med["hour"] and now.minute == med["minute"]:
-                print(f"[REMINDER] Time to take {med['name']}")
 
+                print(f"[REMINDER] Time to take {med['name']}")
                 try:
                     t0 = time.time()
                     r = requests.post(
@@ -210,7 +266,7 @@ def reminder_scheduler():
                         json={
                             "usuario_id": USER_ID,
                             "medicamento": med["name"],
-                            "dosis": "100mg",
+                            "dosis": "",
                             "hora": f"{now.hour:02d}:{now.minute:02d}",
                             # usa el tz_offset que prefieras; aquí omitido
                         },
@@ -251,7 +307,7 @@ pre_buffer_frames = deque(maxlen=int(RATE / porcupine.frame_length * 1))
 # -----------------------------------------------------------------------------
 
 threading.Thread(target=mcp_worker, daemon=True).start()
-threading.Thread(target=reminder_scheduler, daemon=True).start()  # <-- actívalo si quieres
+# threading.Thread(target=reminder_scheduler, daemon=True).start()  # <-- actívalo si quieres
 
 print("Listening for wake word...")
 
