@@ -77,34 +77,57 @@ def play_audio(filename):
 # === NUEVO: helper para reproducir SIEMPRE WAV, convirtiendo si hace falta ===
 def play_response_bytes_as_wav(resp_bytes: bytes, content_type: str | None):
     """
-    Reproduce la respuesta del backend como WAV.
-    - Si el Content-Type indica WAV, reproduce directo.
-    - Si indica MP3 (o no indica nada), convierte a WAV con pydub/ffmpeg y reproduce.
+    Normaliza cualquier respuesta (wav/mp3) a WAV PCM S16 mono 16k
+    y la reproduce con aplay. Evita 'estática' por formatos raros.
     """
     ct = (content_type or "").lower()
     tmp_path = None
-    try:
-        if "wav" in ct:
-            # Ya es WAV
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp.write(resp_bytes)
-                tmp_path = tmp.name
-        else:
-            # Asumimos MP3 u otro formato -> convertir a WAV
-            # Si no hay CT, intentamos mp3 por defecto
-            assumed_format = "mp3" if ("mp3" in ct or ct == "" or "mpeg" in ct) else "mp3"
-            audio = AudioSegment.from_file(io.BytesIO(resp_bytes), format=assumed_format)
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                audio.export(tmp.name, format="wav")
-                tmp_path = tmp.name
 
+    # Heurística de formato
+    if "wav" in ct:
+        fmt = "wav"
+    elif "mp3" in ct or "mpeg" in ct:
+        fmt = "mp3"
+    else:
+        # sniff rápido: ID3 -> MP3, RIFF....WAVE -> WAV
+        if resp_bytes[:3] == b"ID3":
+            fmt = "mp3"
+        elif resp_bytes[:4] == b"RIFF" and resp_bytes[8:12] == b"WAVE":
+            fmt = "wav"
+        else:
+            fmt = "mp3"  # mejor asumir mp3 si no sabemos
+
+    try:
+        # 1) Decodifica a AudioSegment
+        audio = AudioSegment.from_file(io.BytesIO(resp_bytes), format=fmt)
+
+        # 2) Normaliza a 16 kHz, mono, 16-bit PCM (S16_LE)
+        audio = (audio
+                 .set_frame_rate(16000)
+                 .set_channels(1)
+                 .set_sample_width(2))  # 2 bytes = 16-bit
+
+        # 3) Exporta a WAV temporal y reproduce
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            # fuerza pcm_s16le por si acaso
+            audio.export(tmp.name, format="wav", parameters=["-acodec", "pcm_s16le"])
+            tmp_path = tmp.name
+
+        play_audio(tmp_path)
+
+    except Exception as e:
+        print(f"[WARN] decode/normalize failed: {e}; intento WAV directo")
+        # Último recurso: tocar lo que llegó como si fuera WAV
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(resp_bytes)
+            tmp_path = tmp.name
         play_audio(tmp_path)
     finally:
         if tmp_path:
             try:
                 os.remove(tmp_path)
             except Exception:
-                pass
+               pass
 
 def mcp_worker():
     """Worker: sends audio to MCP endpoint and plays response."""
