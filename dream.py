@@ -210,7 +210,7 @@ def reminder_scheduler():
                         json={
                             "usuario_id": USER_ID,
                             "medicamento": med["name"],
-                            "dosis": "",
+                            "dosis": "100mg",
                             "hora": f"{now.hour:02d}:{now.minute:02d}",
                             # usa el tz_offset que prefieras; aquí omitido
                         },
@@ -251,7 +251,7 @@ pre_buffer_frames = deque(maxlen=int(RATE / porcupine.frame_length * 1))
 # -----------------------------------------------------------------------------
 
 threading.Thread(target=mcp_worker, daemon=True).start()
-# threading.Thread(target=reminder_scheduler, daemon=True).start()  # <-- actívalo si quieres
+threading.Thread(target=reminder_scheduler, daemon=True).start()  # <-- actívalo si quieres
 
 print("Listening for wake word...")
 
