@@ -33,8 +33,11 @@ RATE = 16000
 RECORD_SECONDS = 5
 QUEUE = queue.Queue()
 
-# Audio local de espera (se reproduce en loop mientras esperamos respuesta del servidor)
-WAIT_AUDIO_PATH = os.path.expanduser("~/esperaRespuesta.wav")  # <-- ajusta la ruta si lo guardas en otro lado
+# Ruta absoluta a la carpeta del proyecto (donde está este script)
+BASE_DIR = os.path.dirname(os.path.abspath(_file_))
+
+# Audio local de espera (dentro del repo)
+WAIT_AUDIO_PATH = os.path.join(BASE_DIR, "PrefabAudios", "waitResponse.wav") 
 
 # Mediciones de tiempo
 last_rec_started_at = 0.0
