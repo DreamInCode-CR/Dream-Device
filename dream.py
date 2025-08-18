@@ -38,7 +38,7 @@ last_rec_started_at = 0.0
 # Agenda de ejemplo (no usada si el thread está comentado)
 MEDICATIONS = [
     {"hour": 8, "minute": 0, "name": "blood pressure pill"},
-    {"hour": 20, "minute": 0, "name": "cholesterol tablet"},
+    {"hour": 16, "minute": 0, "name": "cholesterol tablet"},
 ]
 
 # Estados
