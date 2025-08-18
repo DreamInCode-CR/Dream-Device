@@ -15,7 +15,7 @@ import requests
 # === Audio decode / convert ===
 from pydub import AudioSegment
 import tempfile
-import subprocess  # <-- añadido para reproducir audio de espera en loop
+import subprocess  # para reproducir audio de espera en loop
 
 # -----------------------------------------------------------------------------
 # Configuración
@@ -33,10 +33,10 @@ RATE = 16000
 RECORD_SECONDS = 5
 QUEUE = queue.Queue()
 
+# BASE_DIR del script (o cwd si no existe _file_)
 try:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # <-- dos guiones bajos a cada lado
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 except NameError:
-    # Fallback si _file_ no existe (p.ej. ejecución interactiva)
     BASE_DIR = os.getcwd()
 
 # Audio local de espera dentro del repo
@@ -164,6 +164,32 @@ def play_response_bytes_as_wav(resp_bytes: bytes, content_type: str):
                 pass
 
 # -----------------------------------------------------------------------------
+# Normalización del audio de espera para evitar 'estática'
+# -----------------------------------------------------------------------------
+
+def _normalize_wait_wav(src_path: str) -> str:
+    """
+    Devuelve una copia WAV normalizada a 16 kHz/mono/16-bit PCM
+    para evitar 'estática' con aplay.
+    """
+    audio = AudioSegment.from_file(src_path)  # decodifica cualquier formato
+    audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+    out_path = os.path.join(tempfile.gettempdir(), "waitResponse__16k_mono.wav")
+    audio.export(out_path, format="wav", parameters=["-acodec", "pcm_s16le"])
+    return out_path
+
+WAIT_AUDIO_PLAY_PATH = None
+if os.path.exists(WAIT_AUDIO_PATH):
+    try:
+        WAIT_AUDIO_PLAY_PATH = _normalize_wait_wav(WAIT_AUDIO_PATH)
+        print(f"[WAIT] Normalized -> {WAIT_AUDIO_PLAY_PATH}")
+    except Exception as e:
+        WAIT_AUDIO_PLAY_PATH = WAIT_AUDIO_PATH
+        print(f"[WAIT] Normalization failed, using raw file: {e}")
+else:
+    print(f"[WAIT] Archivo no encontrado: {WAIT_AUDIO_PATH}")
+
+# -----------------------------------------------------------------------------
 # Audio de espera (loop hasta que llegue la respuesta del servidor)
 # -----------------------------------------------------------------------------
 
@@ -213,9 +239,9 @@ def mcp_worker():
         file_to_upload, expect_followup = QUEUE.get()
         wait_stop = None
         try:
-            # Arranca el audio de espera si existe
-            if os.path.exists(WAIT_AUDIO_PATH):
-                wait_stop = start_wait_loop(WAIT_AUDIO_PATH)
+            # Arranca el audio de espera (usa la versión normalizada)
+            if WAIT_AUDIO_PLAY_PATH and os.path.exists(WAIT_AUDIO_PLAY_PATH):
+                wait_stop = start_wait_loop(WAIT_AUDIO_PLAY_PATH)
 
             with open(file_to_upload, 'rb') as f:
                 t0 = time.time()
@@ -245,7 +271,6 @@ def mcp_worker():
                 print(f"[MCP ERROR] Status: {response.status_code}")
         except Exception as e:
             print(f"[MCP ERROR] {e}")
-            # Asegurar detener audio de espera si hubo error
             if wait_stop:
                 wait_stop.set()
         finally:
@@ -266,8 +291,8 @@ def reminder_scheduler():
         now = datetime.now()
         for med in MEDICATIONS:
             if now.hour == med["hour"] and now.minute == med["minute"]:
-
                 print(f"[REMINDER] Time to take {med['name']}")
+
                 try:
                     t0 = time.time()
                     r = requests.post(
@@ -277,7 +302,6 @@ def reminder_scheduler():
                             "medicamento": med["name"],
                             "dosis": "",
                             "hora": f"{now.hour:02d}:{now.minute:02d}",
-                            # usa el tz_offset que prefieras; aquí omitido
                         },
                         timeout=30,
                     )
