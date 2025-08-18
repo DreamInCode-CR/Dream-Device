@@ -33,11 +33,17 @@ RATE = 16000
 RECORD_SECONDS = 5
 QUEUE = queue.Queue()
 
-# Ruta absoluta a la carpeta del proyecto (donde está este script)
-BASE_DIR = os.path.dirname(os.path.abspath(_file_))
+try:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # <-- dos guiones bajos a cada lado
+except NameError:
+    # Fallback si _file_ no existe (p.ej. ejecución interactiva)
+    BASE_DIR = os.getcwd()
 
-# Audio local de espera (dentro del repo)
-WAIT_AUDIO_PATH = os.path.join(BASE_DIR, "PrefabAudios", "waitResponse.wav") 
+# Audio local de espera dentro del repo
+WAIT_AUDIO_PATH = os.path.join(BASE_DIR, "PrefabAudios", "waitResponse.wav")
+
+# (opcional) log para verificar
+print(f"[WAIT] Usando: {WAIT_AUDIO_PATH}  Existente={os.path.exists(WAIT_AUDIO_PATH)}")
 
 # Mediciones de tiempo
 last_rec_started_at = 0.0
