@@ -1,123 +1,144 @@
-import pvporcupine
-import pyaudio
-import struct
-import wave
-import requests
-import threading
-import queue
-import time
 import os
+import io
+import time
+import wave
+import queue
+import struct
+import threading
 from collections import deque
 from datetime import datetime
 
-# === NUEVO: imports para la conversión MP3->WAV (si llega MP3) ===
+import pvporcupine
+import pyaudio
+import requests
+
+# === Audio decode / convert ===
 from pydub import AudioSegment
-import io
 import tempfile
 
-# (opcional) asegura que pydub use ffmpeg del PATH
-os.environ.setdefault("FFMPEG_BINARY", "ffmpeg")
-try:
-    # En muchas Raspberry Pi, ffmpeg está en /usr/bin/ffmpeg
-    if os.path.exists("/usr/bin/ffmpeg"):
-        AudioSegment.converter = "/usr/bin/ffmpeg"
-except Exception:
-    pass
+# -----------------------------------------------------------------------------
+# Configuración
+# -----------------------------------------------------------------------------
 
-# === CONFIG ===
 ACCESS_KEY = "heQRVcJzahp/QdflX+KJRkOr6yvkclzaAKK6fY1NEKdYwtowZocbOg=="
 WAKE_WORD = "porcupine"
-VOICE_MCP_URL = "https://dreamincode-abgjgwgfckbqergq.eastus-01.azurewebsites.net/voice_mcp"
 
-USER_ID = 3   # <--- assign elderly user ID here
+VOICE_MCP_URL = "https://dreamincode-abgjgwgfckbqergq.eastus-01.azurewebsites.net/voice_mcp"
+REMINDER_TTS_URL = "https://dreamincode-abgjgwgfckbqergq.eastus-01.azurewebsites.net/reminder_tts"
+
+USER_ID = 3            # id del adulto mayor
 CHANNELS = 1
 RATE = 16000
 RECORD_SECONDS = 5
 QUEUE = queue.Queue()
 
-# Medicine schedule
+# Mediciones de tiempo
+last_rec_started_at = 0.0
+
+# Agenda de ejemplo (no usada si el thread está comentado)
 MEDICATIONS = [
     {"hour": 8, "minute": 0, "name": "blood pressure pill"},
-    {"hour": 20, "minute": 0, "name": "cholesterol tablet"}
+    {"hour": 20, "minute": 0, "name": "cholesterol tablet"},
 ]
 
-# States
+# Estados
 IDLE = "IDLE"
 CONVERSATION_ACTIVE = "CONVERSATION_ACTIVE"
 WAITING_FOR_CONFIRMATION = "WAITING_FOR_CONFIRMATION"
 state = IDLE
 last_activity_time = time.time()
 
-# === INIT PORCUPINE ===
-porcupine = pvporcupine.create(access_key=ACCESS_KEY, keywords=[WAKE_WORD])
+# -----------------------------------------------------------------------------
+# pydub/ffmpeg
+# -----------------------------------------------------------------------------
+# (opcional) asegurarnos de usar /usr/bin/ffmpeg si existe
+os.environ.setdefault("FFMPEG_BINARY", "ffmpeg")
+try:
+    if os.path.exists("/usr/bin/ffmpeg"):
+        AudioSegment.converter = "/usr/bin/ffmpeg"
+except Exception:
+    pass
 
-# === AUDIO INIT ===
-pa = pyaudio.PyAudio()
-stream = pa.open(
-    rate=porcupine.sample_rate,
-    channels=CHANNELS,
-    format=pyaudio.paInt16,
-    input=True,
-    frames_per_buffer=porcupine.frame_length
-)
-
-# Pre-buffer 1 sec before trigger
-pre_buffer_frames = deque(maxlen=int(RATE / porcupine.frame_length * 1))
+# -----------------------------------------------------------------------------
+# Utilidades de audio local
+# -----------------------------------------------------------------------------
 
 def save_audio_from_frames(filename, frames):
-    with wave.open(filename, 'wb') as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(pa.get_sample_size(pyaudio.paInt16))
-        wf.setframerate(RATE)
-        wf.writeframes(b''.join(frames))
+    """Guarda frames PCM S16 a un WAV mono 16k."""
+    pa = pyaudio.PyAudio()
+    try:
+        with wave.open(filename, 'wb') as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(pa.get_sample_size(pyaudio.paInt16))
+            wf.setframerate(RATE)
+            wf.writeframes(b''.join(frames))
+    finally:
+        pa.terminate()
 
 def play_audio(filename):
-    os.system(f"aplay {filename} >/dev/null 2>&1")
+    # aplay maneja perfecto PCM S16LE 16k mono
+    os.system(f"aplay '{filename}' >/dev/null 2>&1")
 
-# === NUEVO: helper para reproducir SIEMPRE WAV, convirtiendo si hace falta ===
-def play_response_bytes_as_wav(resp_bytes: bytes, content_type: str | None):
+# -----------------------------------------------------------------------------
+# Sniff de formato y reproducción robusta
+# -----------------------------------------------------------------------------
+
+def looks_like_mp3(buf: bytes) -> bool:
+    if len(buf) < 2:
+        return False
+    # ID3 tag
+    if buf[:3] == b"ID3":
+        return True
+    # Frame sync: 0xFF seguido de byte con 3 bits altos = 111xxxxx
+    return buf[0] == 0xFF and (buf[1] & 0xE0) == 0xE0
+
+def looks_like_wav(buf: bytes) -> bool:
+    # RIFF .... WAVE
+    return len(buf) >= 12 and buf[:4] == b"RIFF" and buf[8:12] == b"WAVE"
+
+def play_response_bytes_as_wav(resp_bytes: bytes, content_type: str):
     """
-    Normaliza cualquier respuesta (wav/mp3) a WAV PCM S16 mono 16k
-    y la reproduce con aplay. Evita 'estática' por formatos raros.
+    Normaliza cualquier respuesta (wav/mp3) a WAV PCM S16 16k mono
+    y la reproduce con aplay. Evita 'estática' por tipos engañosos.
     """
     ct = (content_type or "").lower()
-    tmp_path = None
 
-    # Heurística de formato
-    if "wav" in ct:
-        fmt = "wav"
-    elif "mp3" in ct or "mpeg" in ct:
-        fmt = "mp3"
+    # 1) Sniff manda (no nos fiamos del Content-Type)
+    if looks_like_wav(resp_bytes):
+        guess_fmt = "wav"
+    elif looks_like_mp3(resp_bytes):
+        guess_fmt = "mp3"
     else:
-        # sniff rápido: ID3 -> MP3, RIFF....WAVE -> WAV
-        if resp_bytes[:3] == b"ID3":
-            fmt = "mp3"
-        elif resp_bytes[:4] == b"RIFF" and resp_bytes[8:12] == b"WAVE":
-            fmt = "wav"
-        else:
-            fmt = "mp3"  # mejor asumir mp3 si no sabemos
+        guess_fmt = "wav" if "wav" in ct else "mp3"
 
+    print(f"[AUDIO] CT={ct or '-'} guess={guess_fmt} bytes={len(resp_bytes)}")
+
+    def decode_as(fmt: str) -> AudioSegment:
+        return AudioSegment.from_file(io.BytesIO(resp_bytes), format=fmt)
+
+    tmp_path = None
     try:
-        # 1) Decodifica a AudioSegment
-        audio = AudioSegment.from_file(io.BytesIO(resp_bytes), format=fmt)
+        # Intento principal
+        try:
+            audio = decode_as(guess_fmt)
+        except Exception as e1:
+            # Reintento con el otro formato
+            alt_fmt = "mp3" if guess_fmt == "wav" else "wav"
+            print(f"[AUDIO] decode as {guess_fmt} falló ({e1}); reintento como {alt_fmt}")
+            audio = decode_as(alt_fmt)
 
-        # 2) Normaliza a 16 kHz, mono, 16-bit PCM (S16_LE)
-        audio = (audio
-                 .set_frame_rate(16000)
-                 .set_channels(1)
-                 .set_sample_width(2))  # 2 bytes = 16-bit
+        # Normalizar a 16 kHz, mono, 16-bit PCM
+        audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
 
-        # 3) Exporta a WAV temporal y reproduce
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            # fuerza pcm_s16le por si acaso
+            # fuerza pcm_s16le
             audio.export(tmp.name, format="wav", parameters=["-acodec", "pcm_s16le"])
             tmp_path = tmp.name
 
         play_audio(tmp_path)
 
     except Exception as e:
-        print(f"[WARN] decode/normalize failed: {e}; intento WAV directo")
-        # Último recurso: tocar lo que llegó como si fuera WAV
+        print(f"[AUDIO] ERROR irrecuperable: {e}; toco 'tal cual' por último recurso")
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp.write(resp_bytes)
             tmp_path = tmp.name
@@ -127,25 +148,29 @@ def play_response_bytes_as_wav(resp_bytes: bytes, content_type: str | None):
             try:
                 os.remove(tmp_path)
             except Exception:
-               pass
+                pass
+
+# -----------------------------------------------------------------------------
+# Worker: envía audio al backend y reproduce la respuesta
+# -----------------------------------------------------------------------------
 
 def mcp_worker():
-    """Worker: sends audio to MCP endpoint and plays response."""
     global state, last_activity_time
     while True:
         file_to_upload, expect_followup = QUEUE.get()
         try:
             with open(file_to_upload, 'rb') as f:
+                t0 = time.time()
                 response = requests.post(
                     VOICE_MCP_URL,
                     files={'audio': (file_to_upload, f, 'audio/wav')},
-                    data={"usuario_id": USER_ID, "lang": "es"},  # <--- USER_ID used here
+                    data={"usuario_id": USER_ID, "lang": "es"},
                     timeout=60
                 )
+                rt = time.time() - t0
 
             if response.status_code == 200:
-                # === CAMBIO: en lugar de guardar a disco y reproducir "respuesta.wav",
-                # usamos el helper que convierte a WAV si hace falta y reproduce.
+                print(f"[NET] round-trip {rt:.2f}s, content-type={response.headers.get('Content-Type')}")
                 play_response_bytes_as_wav(response.content, response.headers.get("Content-Type"))
                 print("[MCP] Got response audio, played.")
 
@@ -158,43 +183,81 @@ def mcp_worker():
                 print(f"[MCP ERROR] Status: {response.status_code}")
         except Exception as e:
             print(f"[MCP ERROR] {e}")
+        finally:
+            try:
+                os.remove(file_to_upload)
+            except Exception:
+                pass
+            QUEUE.task_done()
 
-        try:
-            os.remove(file_to_upload)
-        except Exception:
-            pass
-        QUEUE.task_done()
+# -----------------------------------------------------------------------------
+# Scheduler de recordatorios (usa /reminder_tts) - opcional
+# -----------------------------------------------------------------------------
 
 def reminder_scheduler():
-    """Medication reminders thread."""
+    """Ejemplo de uso del endpoint /reminder_tts."""
     global state
     while True:
         now = datetime.now()
         for med in MEDICATIONS:
             if now.hour == med["hour"] and now.minute == med["minute"]:
                 print(f"[REMINDER] Time to take {med['name']}")
-                reminder_file = "reminder.wav"
 
-                response = requests.post(
-                    VOICE_MCP_URL,
-                    data={"usuario_id": USER_ID, "lang": "en"},  # <--- USER_ID used here too
-                    files={'audio': ("reminder.wav", b"", 'audio/wav')}
-                )
+                try:
+                    t0 = time.time()
+                    r = requests.post(
+                        REMINDER_TTS_URL,
+                        json={
+                            "usuario_id": USER_ID,
+                            "medicamento": med["name"],
+                            "dosis": "",
+                            "hora": f"{now.hour:02d}:{now.minute:02d}",
+                            # usa el tz_offset que prefieras; aquí omitido
+                        },
+                        timeout=30,
+                    )
+                    rt = time.time() - t0
+                    if r.status_code == 200:
+                        print(f"[REMINDER] TTS ok ({rt:.2f}s) ct={r.headers.get('Content-Type')}")
+                        play_response_bytes_as_wav(r.content, r.headers.get("Content-Type"))
+                        state = WAITING_FOR_CONFIRMATION
+                    else:
+                        print(f"[REMINDER] HTTP {r.status_code}")
+                except Exception as e:
+                    print(f"[REMINDER] error: {e}")
 
-                if response.status_code == 200:
-                    with open(reminder_file, "wb") as f:
-                        f.write(response.content)
-                    play_audio(reminder_file)
-                    os.remove(reminder_file)
-
-                state = WAITING_FOR_CONFIRMATION
         time.sleep(60)
 
-# Start threads
+# -----------------------------------------------------------------------------
+# Inicialización de audio + Porcupine
+# -----------------------------------------------------------------------------
+
+porcupine = pvporcupine.create(access_key=ACCESS_KEY, keywords=[WAKE_WORD])
+
+pa = pyaudio.PyAudio()
+stream = pa.open(
+    rate=porcupine.sample_rate,
+    channels=CHANNELS,
+    format=pyaudio.paInt16,
+    input=True,
+    frames_per_buffer=porcupine.frame_length
+)
+
+# pre-buffer de ~1 s antes del trigger
+pre_buffer_frames = deque(maxlen=int(RATE / porcupine.frame_length * 1))
+
+# -----------------------------------------------------------------------------
+# Lanzar threads
+# -----------------------------------------------------------------------------
+
 threading.Thread(target=mcp_worker, daemon=True).start()
-# threading.Thread(target=reminder_scheduler, daemon=True).start()
+# threading.Thread(target=reminder_scheduler, daemon=True).start()  # <-- actívalo si quieres
 
 print("Listening for wake word...")
+
+# -----------------------------------------------------------------------------
+# Bucle principal
+# -----------------------------------------------------------------------------
 
 try:
     while True:
@@ -211,10 +274,16 @@ try:
             keyword_index = porcupine.process(pcm_unpacked)
             if keyword_index >= 0:
                 print("[DETECTED] Wake word")
+
                 frames = list(pre_buffer_frames)
+                last_rec_started_at = time.time()
                 for _ in range(int(RATE / porcupine.frame_length * RECORD_SECONDS)):
                     frames.append(stream.read(porcupine.frame_length, exception_on_overflow=False))
+                rec_dur = time.time() - last_rec_started_at
+                print(f"[REC] dur={rec_dur:.2f}s frames={len(frames)}")
+
                 save_audio_from_frames("wake_audio.wav", frames)
+                print("[REC] archivo= wake_audio.wav; subiendo…")
                 QUEUE.put(("wake_audio.wav", True))
 
         elif state in (CONVERSATION_ACTIVE, WAITING_FOR_CONFIRMATION):
@@ -222,16 +291,27 @@ try:
                 state = IDLE
             else:
                 frames = []
+                last_rec_started_at = time.time()
                 for _ in range(int(RATE / porcupine.frame_length * RECORD_SECONDS)):
                     frames.append(stream.read(porcupine.frame_length, exception_on_overflow=False))
+                rec_dur = time.time() - last_rec_started_at
+                print(f"[REC] (follow-up) dur={rec_dur:.2f}s frames={len(frames)}")
+
                 save_audio_from_frames("followup.wav", frames)
+                print("[REC] archivo= followup.wav; subiendo…")
                 QUEUE.put(("followup.wav", True))
                 last_activity_time = time.time()
 
 except KeyboardInterrupt:
     print("\nShutting down...")
 finally:
-    stream.stop_stream()
-    stream.close()
+    try:
+        stream.stop_stream()
+        stream.close()
+    except Exception:
+        pass
     pa.terminate()
-    porcupine.delete()
+    try:
+        porcupine.delete()
+    except Exception:
+        pass
