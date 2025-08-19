@@ -6,7 +6,6 @@ import queue
 import struct
 import threading
 import shutil
-import datetime
 from collections import deque
 from datetime import datetime
 
@@ -381,7 +380,7 @@ def speak(text: str):
         print(f"[SPEAK] error: {e}")
 
 
-
+import datetime
 def reminder_scheduler():
     while True:
         now = datetime.datetime.now()
