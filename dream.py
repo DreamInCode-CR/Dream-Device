@@ -137,49 +137,62 @@ def _have_mpg123() -> bool:
 
 def play_response_bytes(resp_bytes: bytes, content_type: str | None):
     """
-    Decide el formato por Content-Type primero; si falta, 'sniff'.
-    - WAV -> guardo .wav y reproduzco con aplay
-    - MP3 -> si hay mpg123, reproduzco directo; si no, convierto a WAV con pydub+ffmpeg y aplay.
+    Robust audio playback:
+    - Sniff bytes first to detect actual format (wav/mp3).
+    - If mismatch with Content-Type, prefer sniff.
+    - Always decode with pydub when uncertain.
     """
-    fmt = _fmt_from_header(content_type) or _sniff_fmt(resp_bytes) or "mp3"
-    print(f"[AUDIO] CT={content_type or '-'} -> fmt={fmt} bytes={len(resp_bytes)}")
+    sniff_fmt = _sniff_fmt(resp_bytes)
+    header_fmt = _fmt_from_header(content_type)
+    fmt = sniff_fmt or header_fmt
 
-    if fmt == "wav":
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp.write(resp_bytes)
-            path = tmp.name
-        try:
-            play_wav(path)
-        finally:
-            try: os.remove(path)
-            except Exception: pass
-        return
+    print(f"[AUDIO] sniff={sniff_fmt} header={header_fmt} -> using {fmt}")
 
-    # MP3
-    if _have_mpg123():
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-            tmp.write(resp_bytes)
-            path = tmp.name
-        try:
-            os.system(f"mpg123 -q '{path}' >/dev/null 2>&1")
-        finally:
-            try: os.remove(path)
-            except Exception: pass
-    else:
-        # fallback: decodificar a WAV y reproducir
-        try:
-            audio = AudioSegment.from_file(io.BytesIO(resp_bytes), format="mp3")
+    try:
+        if fmt == "wav":
+            # trust only if sniff says WAV
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp.write(resp_bytes)
+                path = tmp.name
+            try:
+                play_wav(path)
+            finally:
+                os.remove(path)
+
+        elif fmt == "mp3":
+            if _have_mpg123():
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                    tmp.write(resp_bytes)
+                    path = tmp.name
+                try:
+                    os.system(f"mpg123 -q '{path}' >/dev/null 2>&1")
+                finally:
+                    os.remove(path)
+            else:
+                # decode to WAV with pydub
+                audio = AudioSegment.from_file(io.BytesIO(resp_bytes), format="mp3")
+                audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    audio.export(tmp.name, format="wav", parameters=["-acodec", "pcm_s16le"])
+                    path = tmp.name
+                play_wav(path)
+                os.remove(path)
+
+        else:
+            # fallback: force decode with pydub (handles wrong headers)
+            audio = AudioSegment.from_file(io.BytesIO(resp_bytes))
             audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 audio.export(tmp.name, format="wav", parameters=["-acodec", "pcm_s16le"])
                 path = tmp.name
             play_wav(path)
-        except Exception as e:
-            print(f"[AUDIO] MP3 fallback failed ({e}); guardo como .bin por depuración")
-            with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
-                tmp.write(resp_bytes)
-                path = tmp.name
-            print(f"[AUDIO] Bytes en: {path}")
+            os.remove(path)
+
+    except Exception as e:
+        print(f"[AUDIO] Playback failed: {e}")
+        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
+            tmp.write(resp_bytes)
+            print(f"[AUDIO] Dumped raw bytes for debug: {tmp.name}")
 
 # -----------------------------------------------------------------------------
 # Inicialización de Porcupine + PyAudio y calibración de ruido
