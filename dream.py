@@ -15,7 +15,7 @@ import requests
 # === Audio decode / convert ===
 from pydub import AudioSegment
 import tempfile
-import subprocess  # para reproducir audio de espera en loop
+import subprocess  # para reproducir audio de espera en loop (ahora 1 sola vez)
 import statistics
 
 # -----------------------------------------------------------------------------
@@ -99,30 +99,20 @@ if os.path.exists(WAIT_AUDIO_PATH):
 else:
     print(f"[WAIT] Archivo no encontrado: {WAIT_AUDIO_PATH}")
 
-def start_wait_loop(file_path: str) -> threading.Event | None:
+# --- NUEVO: reproducción de espera SOLO UNA VEZ (no loop) ---
+def play_wait_once(file_path: str):
+    """Devuelve el proceso de aplay para poder cortarlo si la respuesta llega antes."""
     if not os.path.exists(file_path):
         return None
-    stop = threading.Event()
-
-    def _loop():
-        while not stop.is_set():
-            try:
-                p = subprocess.Popen(
-                    ["aplay", "-q", file_path],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-                while p.poll() is None:
-                    if stop.is_set():
-                        try: p.terminate()
-                        except Exception: pass
-                        break
-                    time.sleep(0.1)
-            except Exception as e:
-                print(f"[WAIT] error reproduciendo: {e}")
-                break
-    threading.Thread(target=_loop, daemon=True).start()
-    return stop
+    try:
+        return subprocess.Popen(
+            ["aplay", "-q", file_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    except Exception as e:
+        print(f"[WAIT] error reproduciendo: {e}")
+        return None
 
 # -----------------------------------------------------------------------------
 # Utilidades WAV locales
@@ -137,7 +127,7 @@ def save_audio_from_frames(filename, frames, sample_rate, sample_width=2, channe
         wf.writeframes(b''.join(frames))
 
 # -----------------------------------------------------------------------------
-# Decodificación/normalización de respuestas (backend -> WAV 16k)
+# Decodificación/normalización de respuestas (backend -> reproducción rápida)
 # -----------------------------------------------------------------------------
 
 def looks_like_mp3(buf: bytes) -> bool:
@@ -150,42 +140,52 @@ def looks_like_mp3(buf: bytes) -> bool:
 def looks_like_wav(buf: bytes) -> bool:
     return len(buf) >= 12 and buf[:4] == b"RIFF" and buf[8:12] == b"WAVE"
 
-def play_response_bytes_as_wav(resp_bytes: bytes, content_type: str):
-    ct = (content_type or "").lower()
-    if looks_like_wav(resp_bytes):
-        guess_fmt = "wav"
-    elif looks_like_mp3(resp_bytes):
-        guess_fmt = "mp3"
-    else:
-        guess_fmt = "wav" if "wav" in ct else "mp3"
+# --- NUEVO: reproductor “fast-path” (evita conversiones) ---
+def _write_temp(suffix: str, data: bytes) -> str:
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(data)
+        return tmp.name
 
-    print(f"[AUDIO] CT={ct or '-'} guess={guess_fmt} bytes={len(resp_bytes)}")
-
-    def decode_as(fmt: str) -> AudioSegment:
-        return AudioSegment.from_file(io.BytesIO(resp_bytes), format=fmt)
-
+def play_response_bytes_fast(resp_bytes: bytes, content_type: str | None):
+    """
+    Reproduce con mínima transformación:
+      - WAV -> aplay
+      - MP3 -> mpg123
+      - si no se reconoce -> último recurso pydub->wav
+    """
+    ct = (content_type or "").lower().strip()
     tmp_path = None
     try:
-        try:
-            audio = decode_as(guess_fmt)
-        except Exception as e1:
-            alt_fmt = "mp3" if guess_fmt == "wav" else "wav"
-            print(f"[AUDIO] decode as {guess_fmt} falló ({e1}); reintento como {alt_fmt}")
-            audio = decode_as(alt_fmt)
+        # fast path por content-type
+        if "audio/wav" in ct or "audio/x-wav" in ct or ct.endswith("/wav") or "wav" in ct:
+            tmp_path = _write_temp(".wav", resp_bytes)
+            os.system(f"aplay -q '{tmp_path}' >/dev/null 2>&1")
+            return
+        if "audio/mpeg" in ct or "mp3" in ct:
+            tmp_path = _write_temp(".mp3", resp_bytes)
+            os.system(f"mpg123 -q '{tmp_path}' >/dev/null 2>&1")
+            return
 
+        # heurística por bytes
+        if looks_like_wav(resp_bytes):
+            tmp_path = _write_temp(".wav", resp_bytes)
+            os.system(f"aplay -q '{tmp_path}' >/dev/null 2>&1")
+            return
+        if looks_like_mp3(resp_bytes):
+            tmp_path = _write_temp(".mp3", resp_bytes)
+            os.system(f"mpg123 -q '{tmp_path}' >/dev/null 2>&1")
+            return
+
+        # último recurso: convertir a wav 16k mono con pydub
+        audio = AudioSegment.from_file(io.BytesIO(resp_bytes))
         audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            audio.export(tmp.name, format="wav", parameters=["-acodec", "pcm_s16le"])
-            tmp_path = tmp.name
-
-        play_audio(tmp_path)
-
+        tmp_path = _write_temp(".wav", b"")
+        audio.export(tmp_path, format="wav", parameters=["-acodec", "pcm_s16le"])
+        os.system(f"aplay -q '{tmp_path}' >/dev/null 2>&1")
     except Exception as e:
-        print(f"[AUDIO] ERROR irrecuperable: {e}; toco 'tal cual'")
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp.write(resp_bytes)
-            tmp_path = tmp.name
-        play_audio(tmp_path)
+        print(f"[AUDIO] Fallback por error: {e}")
+        tmp_path = _write_temp(".wav", resp_bytes)
+        os.system(f"aplay -q '{tmp_path}' >/dev/null 2>&1")
     finally:
         if tmp_path:
             try: os.remove(tmp_path)
@@ -216,7 +216,6 @@ def _rms_int16(pcm_bytes: bytes) -> float:
     if count == 0:
         return 0.0
     samples = struct.unpack("<" + "h"*count, pcm_bytes[:count*2])
-    # RMS
     acc = 0
     for s in samples:
         acc += s*s
@@ -252,7 +251,6 @@ def record_utterance_vad(prebuffer=None) -> tuple[list[bytes], float]:
     speech_started = False
     t0 = time.perf_counter()
 
-    # pre-roll
     if prebuffer:
         frames.extend(list(prebuffer))
 
@@ -283,13 +281,11 @@ def wait_for_speech_then_record_vad(timeout_s=FOLLOWUP_LISTEN_WINDOW_S) -> tuple
     Si no hay voz en 'timeout_s', retorna ([], 0.0).
     """
     t_start = time.perf_counter()
-    # Espera inicio de voz
     while (time.perf_counter() - t_start) < timeout_s:
         b = stream.read(FRAME_LEN, exception_on_overflow=False)
-        pre_buffer_frames.append(b)  # por si quieres pre-roll del follow-up también
+        pre_buffer_frames.append(b)
         rms = _rms_int16(b)
         if rms >= ENERGY_THRESHOLD:
-            # ya hay voz — arranca captura usando VAD
             frames, dur = record_utterance_vad(prebuffer=pre_buffer_frames)
             return frames, dur
     return [], 0.0
@@ -302,10 +298,11 @@ def mcp_worker():
     global state, last_activity_time, last_followup_sent_at
     while True:
         file_to_upload, expect_followup = QUEUE.get()
-        wait_stop = None
+        wait_proc = None
         try:
+            # Reproduce audio de espera UNA sola vez
             if WAIT_AUDIO_PLAY_PATH and os.path.exists(WAIT_AUDIO_PLAY_PATH):
-                wait_stop = start_wait_loop(WAIT_AUDIO_PLAY_PATH)
+                wait_proc = play_wait_once(WAIT_AUDIO_PLAY_PATH)
 
             with open(file_to_upload, 'rb') as f:
                 t0 = time.time()
@@ -317,26 +314,30 @@ def mcp_worker():
                 )
                 rt = time.time() - t0
 
-            if wait_stop:
-                wait_stop.set()
+            # corta la espera si sigue sonando
+            if wait_proc and (wait_proc.poll() is None):
+                try: wait_proc.terminate()
+                except Exception: pass
 
             if response.status_code == 200:
                 print(f"[NET] round-trip {rt:.2f}s, content-type={response.headers.get('Content-Type')}")
-                play_response_bytes_as_wav(response.content, response.headers.get("Content-Type"))
+                # Reproductor rápido sin conversiones pesadas
+                play_response_bytes_fast(response.content, response.headers.get("Content-Type"))
                 print("[MCP] Got response audio, played.")
 
                 if expect_followup:
                     state = CONVERSATION_ACTIVE
                     last_activity_time = time.time()
-                    last_followup_sent_at = 0.0  # reset anti-rebote
+                    last_followup_sent_at = 0.0
                 else:
                     state = IDLE
             else:
                 print(f"[MCP ERROR] Status: {response.status_code}")
         except Exception as e:
             print(f"[MCP ERROR] {e}")
-            if wait_stop:
-                wait_stop.set()
+            if wait_proc and (wait_proc.poll() is None):
+                try: wait_proc.terminate()
+                except Exception: pass
         finally:
             try:
                 os.remove(file_to_upload)
@@ -371,7 +372,7 @@ def reminder_scheduler():
                     rt = time.time() - t0
                     if r.status_code == 200:
                         print(f"[REMINDER] TTS ok ({rt:.2f}s) ct={r.headers.get('Content-Type')}")
-                        play_response_bytes_as_wav(r.content, r.headers.get("Content-Type"))
+                        play_response_bytes_fast(r.content, r.headers.get("Content-Type"))
                         state = WAITING_FOR_CONFIRMATION
                     else:
                         print(f"[REMINDER] HTTP {r.status_code}")
@@ -394,7 +395,6 @@ print("Listening for wake word...")
 
 try:
     while True:
-        # lee frame para Porcupine + prebuffer
         try:
             pcm = stream.read(FRAME_LEN, exception_on_overflow=False)
         except Exception as e:
@@ -408,20 +408,16 @@ try:
             keyword_index = porcupine.process(pcm_unpacked)
             if keyword_index >= 0:
                 print("[DETECTED] Wake word")
-                # Graba la frase con VAD (incluye 1s pre-roll)
                 frames, dur = record_utterance_vad(prebuffer=pre_buffer_frames)
                 print(f"[REC] wake dur={dur:.2f}s frames={len(frames)}")
                 save_audio_from_frames("wake_audio.wav", frames, SAMPLE_RATE)
                 print("[REC] archivo= wake_audio.wav; subiendo…")
                 QUEUE.put(("wake_audio.wav", True))
-                # NOTA: el estado se actualiza en el worker tras reproducir respuesta
 
         elif state in (CONVERSATION_ACTIVE, WAITING_FOR_CONFIRMATION):
-            # Anti-rebote para no spamear
             if last_followup_sent_at and (time.time() - last_followup_sent_at) < FOLLOWUP_COOLDOWN_S:
                 continue
 
-            # Espera voz y graba follow-up con VAD
             frames, dur = wait_for_speech_then_record_vad(timeout_s=FOLLOWUP_LISTEN_WINDOW_S)
             if frames:
                 print(f"[REC] follow-up dur={dur:.2f}s frames={len(frames)}")
@@ -431,7 +427,6 @@ try:
                 last_activity_time = time.time()
                 last_followup_sent_at = time.time()
             else:
-                # No hubo habla en ventana -> volver a IDLE
                 state = IDLE
 
 except KeyboardInterrupt:
