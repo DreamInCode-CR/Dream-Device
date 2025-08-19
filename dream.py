@@ -1,4 +1,3 @@
-
 import os
 import io
 import time
@@ -25,8 +24,12 @@ import statistics
 
 ACCESS_KEY = "heQRVcJzahp/QdflX+KJRkOr6yvkclzaAKK6fY1NEKdYwtowZocbOg=="
 
-VOICE_MCP_URL = "https://dreamincode-abgjgwgfckbqergq.eastus-01.azurewebsites.net/voice_mcp"
-REMINDER_TTS_URL = "https://dreamincode-abgjgwgfckbqergq.eastus-01.azurewebsites.net/reminder_tts"
+# --- ENDPOINTS base y rutas específicas ---
+BASE_URL         = "https://dreamincode-abgjgwgfckbqergq.eastus-01.azurewebsites.net"
+VOICE_MCP_URL    = f"{BASE_URL}/voice_mcp"
+REMINDER_TTS_URL = f"{BASE_URL}/reminder_tts"
+MEDS_ALL_URL     = f"{BASE_URL}/meds/all"   # <-- para fetch_medications()
+TTS_URL          = f"{BASE_URL}/tts"        # <-- para speak()
 
 USER_ID = 3            # id del adulto mayor
 CHANNELS = 1
@@ -106,7 +109,7 @@ def save_audio_from_frames(filename, frames, sample_rate, sample_width=2, channe
         wf.writeframes(b''.join(frames))
 
 # -----------------------------------------------------------------------------
-# Reproducción robusta de respuestas del backend (sin estática / sin mpg123)
+# Reproducción robusta de respuestas del backend (sin estática)
 # -----------------------------------------------------------------------------
 
 def _fmt_from_header(ct: str | None) -> str | None:
@@ -126,15 +129,18 @@ def _sniff_fmt(b: bytes) -> str | None:
         return "mp3"
     return None
 
+def _have_mpg123() -> bool:
+    return shutil.which("mpg123") is not None
+
 def play_response_bytes(resp_bytes: bytes, content_type: str | None):
     """
-    Reproduce audio de forma robusta:
-    - Si el contenido REAL es WAV -> lo guarda temporalmente y usa aplay.
-    - Si es MP3 (o el header miente) -> SIEMPRE lo decodifica con pydub/ffmpeg
-      a WAV 16 kHz mono PCM y lo reproduce con aplay.
-    Esto evita el uso de mpg123 y elimina los 'Segmentation fault'.
+    Robust audio playback:
+    - Sniff bytes first to detect actual format (wav/mp3).
+    - If mismatch with Content-Type, prefer sniff.
+    - WAV: reproducir tal cual.
+    - MP3: si hay mpg123 usarlo; si no, decodificar con pydub -> WAV 16k.
     """
-    sniff_fmt  = _sniff_fmt(resp_bytes)
+    sniff_fmt = _sniff_fmt(resp_bytes)
     header_fmt = _fmt_from_header(content_type)
     fmt = sniff_fmt or header_fmt
     print(f"[AUDIO] sniff={sniff_fmt} header={header_fmt} -> using {fmt}")
@@ -148,17 +154,33 @@ def play_response_bytes(resp_bytes: bytes, content_type: str | None):
                 play_wav(path)
             finally:
                 os.remove(path)
-            return
 
-        # MP3 o formato dudoso: siempre convertir a WAV 16k/mono/S16
-        audio = AudioSegment.from_file(io.BytesIO(resp_bytes), format="mp3" if fmt == "mp3" else None)
-        audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            audio.export(tmp.name, format="wav", parameters=["-acodec", "pcm_s16le"])
-            path = tmp.name
-        try:
+        elif fmt == "mp3":
+            if _have_mpg123():
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                    tmp.write(resp_bytes)
+                    path = tmp.name
+                try:
+                    os.system(f"mpg123 -q '{path}' >/dev/null 2>&1")
+                finally:
+                    os.remove(path)
+            else:
+                audio = AudioSegment.from_file(io.BytesIO(resp_bytes), format="mp3")
+                audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    audio.export(tmp.name, format="wav", parameters=["-acodec", "pcm_s16le"])
+                    path = tmp.name
+                play_wav(path)
+                os.remove(path)
+
+        else:
+            # fallback: forzar decodificación (maneja headers incorrectos)
+            audio = AudioSegment.from_file(io.BytesIO(resp_bytes))
+            audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                audio.export(tmp.name, format="wav", parameters=["-acodec", "pcm_s16le"])
+                path = tmp.name
             play_wav(path)
-        finally:
             os.remove(path)
 
     except Exception as e:
@@ -172,7 +194,7 @@ def play_response_bytes(resp_bytes: bytes, content_type: str | None):
 # -----------------------------------------------------------------------------
 
 WAKE_DIR = os.path.join(BASE_DIR, "Wakewords")
-KEYWORD_PATH = os.path.join(WAKE_DIR, "Hey-Dream_en_raspberry-pi_v3_0_0.ppn")
+KEYWORD_PATH = os.path.join(WAKE_DIR, "Hey-Dream_en_raspberry-pi_v3_0_0.ppn")  # tu .ppn
 
 porcupine = pvporcupine.create(
     access_key=ACCESS_KEY,
@@ -311,22 +333,23 @@ def mcp_worker():
             QUEUE.task_done()
 
 # -----------------------------------------------------------------------------
-# Scheduler de recordatorios (usa /meds/all + /reminder_tts) - opcional
+# Scheduler de recordatorios (usa /meds/all + /tts)
 # -----------------------------------------------------------------------------
 
 FIRED_REMINDERS = set()
-MEDICATIONS = []
+MEDICATIONS: list[dict] = []
 
 def fetch_medications():
     global MEDICATIONS
     try:
         r = requests.get(
-            f"{REMINDER_TTS_URL}/meds/all",
+            MEDS_ALL_URL,                     # <-- raíz correcta
             params={"usuario_id": USER_ID},
             timeout=10
         )
         if r.status_code == 200:
-            meds = r.json().get("medications", []) or r.json().get("items", [])
+            payload = r.json()
+            meds = payload.get("items", []) or payload.get("medications", [])
             if isinstance(meds, list):
                 MEDICATIONS = meds
                 print(f"[MEDS] Updated medications: {len(MEDICATIONS)} items")
@@ -345,8 +368,8 @@ def medication_refresher():
 def speak(text: str):
     try:
         r = requests.post(
-            REMINDER_TTS_URL,
-            json={"usuario_id": USER_ID, "texto": text},
+            TTS_URL,                          # <-- usar /tts
+            json={"texto": text},
             timeout=30
         )
         if r.status_code == 200:
@@ -361,7 +384,7 @@ import datetime as _dt
 def reminder_scheduler():
     while True:
         now = _dt.datetime.now()
-        weekday_en = now.strftime("%A")
+        weekday_en = now.strftime("%A")         # e.g. 'Monday'
         weekday_key = {
             "Monday": "Lunes",
             "Tuesday": "Martes",
@@ -380,6 +403,7 @@ def reminder_scheduler():
                 if not med.get("Activo", True):
                     continue
 
+                # Rango de fechas (permitir nulos)
                 start_s = med.get("FechaInicio")
                 end_s   = med.get("FechaHasta")
                 if start_s:
@@ -391,18 +415,22 @@ def reminder_scheduler():
                     if today > end:
                         continue
 
+                # Día de la semana
                 if not med.get(weekday_key, False):
                     continue
 
+                # Hora exacta
                 if med.get("HoraToma") != current_time:
                     continue
 
+                # Evitar repetir dentro del mismo minuto
                 med_id = med.get("MedicamentoID") or med.get("NombreMedicamento")
                 key = (today_iso, current_time, str(med_id))
                 if key in FIRED_REMINDERS:
                     continue
                 FIRED_REMINDERS.add(key)
 
+                # Armar texto
                 name = med.get("NombreMedicamento", "tu medicamento")
                 dose = med.get("Dosis", "")
                 instructions = med.get("Instrucciones", "")
@@ -415,7 +443,7 @@ def reminder_scheduler():
             except Exception as e:
                 print(f"[REMINDER] Error processing med {med.get('MedicamentoID')}: {e}")
 
-        time.sleep(60)
+        time.sleep(60)  # check every minute
 
 # -----------------------------------------------------------------------------
 # Lanzar threads
