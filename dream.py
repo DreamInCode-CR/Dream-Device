@@ -16,6 +16,7 @@ import requests
 from pydub import AudioSegment
 import tempfile
 import subprocess  # para reproducir audio de espera en loop
+import statistics
 
 # -----------------------------------------------------------------------------
 # Configuración
@@ -29,21 +30,24 @@ REMINDER_TTS_URL = "https://dreamincode-abgjgwgfckbqergq.eastus-01.azurewebsites
 
 USER_ID = 3            # id del adulto mayor
 CHANNELS = 1
-RATE = 16000
-RECORD_SECONDS = 5
+RATE = 16000          # destino para normalización / guardado WAV
 QUEUE = queue.Queue()
 
-# BASE_DIR del script (o cwd si no existe _file_)
-try:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-except NameError:
-    BASE_DIR = os.getcwd()
+# VAD / conversación
+MIN_SPEECH_MS = 500            # mínimo de voz acumulada para considerar "frase" válida
+TRAILING_SILENCE_MS = 700      # silencio para cortar al final
+MAX_UTTERANCE_S = 8            # tope duro por utterance
+FOLLOWUP_LISTEN_WINDOW_S = 10  # ventana para esperar que el usuario empiece a hablar
+FOLLOWUP_COOLDOWN_S = 0.8      # anti rebote tras enviar un followup
 
-# Audio local de espera dentro del repo
-WAIT_AUDIO_PATH = os.path.join(BASE_DIR, "PrefabAudios", "waitResponse.wav")
-
-# (opcional) log para verificar
-print(f"[WAIT] Usando: {WAIT_AUDIO_PATH}  Existente={os.path.exists(WAIT_AUDIO_PATH)}")
+# Estados
+IDLE = "IDLE"
+WAITING_FOR_SPEECH = "WAITING_FOR_SPEECH"      # esperando voz del usuario
+CONVERSATION_ACTIVE = "CONVERSATION_ACTIVE"    # hubo respuesta TTS; podemos escuchar follow-ups
+WAITING_FOR_CONFIRMATION = "WAITING_FOR_CONFIRMATION"
+state = IDLE
+last_activity_time = time.time()
+last_followup_sent_at = 0.0
 
 # Mediciones de tiempo
 last_rec_started_at = 0.0
@@ -54,17 +58,9 @@ MEDICATIONS = [
     {"hour": 20, "minute": 0, "name": "cholesterol tablet"},
 ]
 
-# Estados
-IDLE = "IDLE"
-CONVERSATION_ACTIVE = "CONVERSATION_ACTIVE"
-WAITING_FOR_CONFIRMATION = "WAITING_FOR_CONFIRMATION"
-state = IDLE
-last_activity_time = time.time()
-
 # -----------------------------------------------------------------------------
 # pydub/ffmpeg
 # -----------------------------------------------------------------------------
-# (opcional) asegurarnos de usar /usr/bin/ffmpeg si existe
 os.environ.setdefault("FFMPEG_BINARY", "ffmpeg")
 try:
     if os.path.exists("/usr/bin/ffmpeg"):
@@ -73,106 +69,20 @@ except Exception:
     pass
 
 # -----------------------------------------------------------------------------
-# Utilidades de audio local
+# Audio local de espera
 # -----------------------------------------------------------------------------
+try:
+    BASE_DIR = os.path.dirname(os.path.abspath(_file_))
+except NameError:
+    BASE_DIR = os.getcwd()
 
-def save_audio_from_frames(filename, frames):
-    """Guarda frames PCM S16 a un WAV mono 16k."""
-    pa = pyaudio.PyAudio()
-    try:
-        with wave.open(filename, 'wb') as wf:
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(pa.get_sample_size(pyaudio.paInt16))
-            wf.setframerate(RATE)
-            wf.writeframes(b''.join(frames))
-    finally:
-        pa.terminate()
+WAIT_AUDIO_PATH = os.path.join(BASE_DIR, "PrefabAudios", "waitResponse.wav")
 
 def play_audio(filename):
-    # aplay maneja perfecto PCM S16LE 16k mono
     os.system(f"aplay '{filename}' >/dev/null 2>&1")
 
-# -----------------------------------------------------------------------------
-# Sniff de formato y reproducción robusta
-# -----------------------------------------------------------------------------
-
-def looks_like_mp3(buf: bytes) -> bool:
-    if len(buf) < 2:
-        return False
-    # ID3 tag
-    if buf[:3] == b"ID3":
-        return True
-    # Frame sync: 0xFF seguido de byte con 3 bits altos = 111xxxxx
-    return buf[0] == 0xFF and (buf[1] & 0xE0) == 0xE0
-
-def looks_like_wav(buf: bytes) -> bool:
-    # RIFF .... WAVE
-    return len(buf) >= 12 and buf[:4] == b"RIFF" and buf[8:12] == b"WAVE"
-
-def play_response_bytes_as_wav(resp_bytes: bytes, content_type: str):
-    """
-    Normaliza cualquier respuesta (wav/mp3) a WAV PCM S16 16k mono
-    y la reproduce con aplay. Evita 'estática' por tipos engañosos.
-    """
-    ct = (content_type or "").lower()
-
-    # 1) Sniff manda (no nos fiamos del Content-Type)
-    if looks_like_wav(resp_bytes):
-        guess_fmt = "wav"
-    elif looks_like_mp3(resp_bytes):
-        guess_fmt = "mp3"
-    else:
-        guess_fmt = "wav" if "wav" in ct else "mp3"
-
-    print(f"[AUDIO] CT={ct or '-'} guess={guess_fmt} bytes={len(resp_bytes)}")
-
-    def decode_as(fmt: str) -> AudioSegment:
-        return AudioSegment.from_file(io.BytesIO(resp_bytes), format=fmt)
-
-    tmp_path = None
-    try:
-        # Intento principal
-        try:
-            audio = decode_as(guess_fmt)
-        except Exception as e1:
-            # Reintento con el otro formato
-            alt_fmt = "mp3" if guess_fmt == "wav" else "wav"
-            print(f"[AUDIO] decode as {guess_fmt} falló ({e1}); reintento como {alt_fmt}")
-            audio = decode_as(alt_fmt)
-
-        # Normalizar a 16 kHz, mono, 16-bit PCM
-        audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
-
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            # fuerza pcm_s16le
-            audio.export(tmp.name, format="wav", parameters=["-acodec", "pcm_s16le"])
-            tmp_path = tmp.name
-
-        play_audio(tmp_path)
-
-    except Exception as e:
-        print(f"[AUDIO] ERROR irrecuperable: {e}; toco 'tal cual' por último recurso")
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp.write(resp_bytes)
-            tmp_path = tmp.name
-        play_audio(tmp_path)
-    finally:
-        if tmp_path:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-
-# -----------------------------------------------------------------------------
-# Normalización del audio de espera para evitar 'estática'
-# -----------------------------------------------------------------------------
-
 def _normalize_wait_wav(src_path: str) -> str:
-    """
-    Devuelve una copia WAV normalizada a 16 kHz/mono/16-bit PCM
-    para evitar 'estática' con aplay.
-    """
-    audio = AudioSegment.from_file(src_path)  # decodifica cualquier formato
+    audio = AudioSegment.from_file(src_path)
     audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
     out_path = os.path.join(tempfile.gettempdir(), "waitResponse__16k_mono.wav")
     audio.export(out_path, format="wav", parameters=["-acodec", "pcm_s16le"])
@@ -189,19 +99,9 @@ if os.path.exists(WAIT_AUDIO_PATH):
 else:
     print(f"[WAIT] Archivo no encontrado: {WAIT_AUDIO_PATH}")
 
-# -----------------------------------------------------------------------------
-# Audio de espera (loop hasta que llegue la respuesta del servidor)
-# -----------------------------------------------------------------------------
-
 def start_wait_loop(file_path: str) -> threading.Event | None:
-    """
-    Reproduce file_path en loop con 'aplay' hasta que returns_stop_event.set() sea llamado.
-    Devuelve el Event para parar. Si no existe el archivo, devuelve None.
-    """
     if not os.path.exists(file_path):
-        print(f"[WAIT] archivo no encontrado: {file_path}")
         return None
-
     stop = threading.Event()
 
     def _loop():
@@ -212,34 +112,198 @@ def start_wait_loop(file_path: str) -> threading.Event | None:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL
                 )
-                # Espera no bloqueante con posibilidad de cortar
                 while p.poll() is None:
                     if stop.is_set():
-                        try:
-                            p.terminate()
-                        except Exception:
-                            pass
+                        try: p.terminate()
+                        except Exception: pass
                         break
                     time.sleep(0.1)
             except Exception as e:
                 print(f"[WAIT] error reproduciendo: {e}")
                 break
-
-    t = threading.Thread(target=_loop, daemon=True)
-    t.start()
+    threading.Thread(target=_loop, daemon=True).start()
     return stop
+
+# -----------------------------------------------------------------------------
+# Utilidades WAV locales
+# -----------------------------------------------------------------------------
+
+def save_audio_from_frames(filename, frames, sample_rate, sample_width=2, channels=1):
+    """Guarda frames PCM (bytes) como WAV."""
+    with wave.open(filename, 'wb') as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(sample_width)
+        wf.setframerate(sample_rate)
+        wf.writeframes(b''.join(frames))
+
+# -----------------------------------------------------------------------------
+# Decodificación/normalización de respuestas (backend -> WAV 16k)
+# -----------------------------------------------------------------------------
+
+def looks_like_mp3(buf: bytes) -> bool:
+    if len(buf) < 2:
+        return False
+    if buf[:3] == b"ID3":
+        return True
+    return buf[0] == 0xFF and (buf[1] & 0xE0) == 0xE0
+
+def looks_like_wav(buf: bytes) -> bool:
+    return len(buf) >= 12 and buf[:4] == b"RIFF" and buf[8:12] == b"WAVE"
+
+def play_response_bytes_as_wav(resp_bytes: bytes, content_type: str):
+    ct = (content_type or "").lower()
+    if looks_like_wav(resp_bytes):
+        guess_fmt = "wav"
+    elif looks_like_mp3(resp_bytes):
+        guess_fmt = "mp3"
+    else:
+        guess_fmt = "wav" if "wav" in ct else "mp3"
+
+    print(f"[AUDIO] CT={ct or '-'} guess={guess_fmt} bytes={len(resp_bytes)}")
+
+    def decode_as(fmt: str) -> AudioSegment:
+        return AudioSegment.from_file(io.BytesIO(resp_bytes), format=fmt)
+
+    tmp_path = None
+    try:
+        try:
+            audio = decode_as(guess_fmt)
+        except Exception as e1:
+            alt_fmt = "mp3" if guess_fmt == "wav" else "wav"
+            print(f"[AUDIO] decode as {guess_fmt} falló ({e1}); reintento como {alt_fmt}")
+            audio = decode_as(alt_fmt)
+
+        audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            audio.export(tmp.name, format="wav", parameters=["-acodec", "pcm_s16le"])
+            tmp_path = tmp.name
+
+        play_audio(tmp_path)
+
+    except Exception as e:
+        print(f"[AUDIO] ERROR irrecuperable: {e}; toco 'tal cual'")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(resp_bytes)
+            tmp_path = tmp.name
+        play_audio(tmp_path)
+    finally:
+        if tmp_path:
+            try: os.remove(tmp_path)
+            except Exception: pass
+
+# -----------------------------------------------------------------------------
+# Inicialización de Porcupine + PyAudio y calibración de ruido
+# -----------------------------------------------------------------------------
+
+porcupine = pvporcupine.create(access_key=ACCESS_KEY, keywords=[WAKE_WORD])
+SAMPLE_RATE = porcupine.sample_rate        # 16000
+FRAME_LEN = porcupine.frame_length         # típicamente 512
+FRAME_MS = int(1000 * FRAME_LEN / SAMPLE_RATE)
+
+pa = pyaudio.PyAudio()
+stream = pa.open(
+    rate=SAMPLE_RATE,
+    channels=CHANNELS,
+    format=pyaudio.paInt16,
+    input=True,
+    frames_per_buffer=FRAME_LEN
+)
+
+def _rms_int16(pcm_bytes: bytes) -> float:
+    if not pcm_bytes:
+        return 0.0
+    count = len(pcm_bytes) // 2
+    if count == 0:
+        return 0.0
+    samples = struct.unpack("<" + "h"*count, pcm_bytes[:count*2])
+    # RMS
+    acc = 0
+    for s in samples:
+        acc += s*s
+    return (acc / count) ** 0.5
+
+def calibrate_noise(frames=50) -> float:
+    vals = []
+    for _ in range(frames):
+        b = stream.read(FRAME_LEN, exception_on_overflow=False)
+        vals.append(_rms_int16(b))
+    med = statistics.median(vals)
+    thr = max(300.0, med * 3.0)  # suelo 300 y 3x del piso
+    print(f"[VAD] noise median={med:.1f} -> threshold={thr:.1f}")
+    return thr
+
+ENERGY_THRESHOLD = calibrate_noise()
+
+# pre-buffer ~1s para la frase tras el wake-word
+pre_buffer_frames = deque(maxlen=int(SAMPLE_RATE / FRAME_LEN * 1))
+
+# -----------------------------------------------------------------------------
+# Grabación controlada por VAD
+# -----------------------------------------------------------------------------
+
+def record_utterance_vad(prebuffer=None) -> tuple[list[bytes], float]:
+    """
+    Graba hasta detectar silencio de cola; requiere MIN_SPEECH_MS de voz.
+    Retorna (frames, dur_seg). frames son bytes PCM S16LE a SAMPLE_RATE.
+    """
+    frames = []
+    speech_ms = 0
+    silence_ms = 0
+    speech_started = False
+    t0 = time.perf_counter()
+
+    # pre-roll
+    if prebuffer:
+        frames.extend(list(prebuffer))
+
+    while True:
+        b = stream.read(FRAME_LEN, exception_on_overflow=False)
+        frames.append(b)
+        rms = _rms_int16(b)
+
+        if rms >= ENERGY_THRESHOLD:
+            speech_started = True
+            speech_ms += FRAME_MS
+            silence_ms = 0
+        else:
+            if speech_started:
+                silence_ms += FRAME_MS
+
+        elapsed = time.perf_counter() - t0
+        if speech_started and speech_ms >= MIN_SPEECH_MS and silence_ms >= TRAILING_SILENCE_MS:
+            break
+        if elapsed >= MAX_UTTERANCE_S:
+            break
+
+    return frames, (time.perf_counter() - t0)
+
+def wait_for_speech_then_record_vad(timeout_s=FOLLOWUP_LISTEN_WINDOW_S) -> tuple[list[bytes], float]:
+    """
+    Espera hasta detectar voz (RMS > threshold) y luego graba con VAD.
+    Si no hay voz en 'timeout_s', retorna ([], 0.0).
+    """
+    t_start = time.perf_counter()
+    # Espera inicio de voz
+    while (time.perf_counter() - t_start) < timeout_s:
+        b = stream.read(FRAME_LEN, exception_on_overflow=False)
+        pre_buffer_frames.append(b)  # por si quieres pre-roll del follow-up también
+        rms = _rms_int16(b)
+        if rms >= ENERGY_THRESHOLD:
+            # ya hay voz — arranca captura usando VAD
+            frames, dur = record_utterance_vad(prebuffer=pre_buffer_frames)
+            return frames, dur
+    return [], 0.0
 
 # -----------------------------------------------------------------------------
 # Worker: envía audio al backend y reproduce la respuesta
 # -----------------------------------------------------------------------------
 
 def mcp_worker():
-    global state, last_activity_time
+    global state, last_activity_time, last_followup_sent_at
     while True:
         file_to_upload, expect_followup = QUEUE.get()
         wait_stop = None
         try:
-            # Arranca el audio de espera (usa la versión normalizada)
             if WAIT_AUDIO_PLAY_PATH and os.path.exists(WAIT_AUDIO_PLAY_PATH):
                 wait_stop = start_wait_loop(WAIT_AUDIO_PLAY_PATH)
 
@@ -253,7 +317,6 @@ def mcp_worker():
                 )
                 rt = time.time() - t0
 
-            # Detener audio de espera en cuanto llega respuesta
             if wait_stop:
                 wait_stop.set()
 
@@ -265,6 +328,7 @@ def mcp_worker():
                 if expect_followup:
                     state = CONVERSATION_ACTIVE
                     last_activity_time = time.time()
+                    last_followup_sent_at = 0.0  # reset anti-rebote
                 else:
                     state = IDLE
             else:
@@ -292,7 +356,6 @@ def reminder_scheduler():
         for med in MEDICATIONS:
             if now.hour == med["hour"] and now.minute == med["minute"]:
                 print(f"[REMINDER] Time to take {med['name']}")
-
                 try:
                     t0 = time.time()
                     r = requests.post(
@@ -314,33 +377,14 @@ def reminder_scheduler():
                         print(f"[REMINDER] HTTP {r.status_code}")
                 except Exception as e:
                     print(f"[REMINDER] error: {e}")
-
         time.sleep(60)
-
-# -----------------------------------------------------------------------------
-# Inicialización de audio + Porcupine
-# -----------------------------------------------------------------------------
-
-porcupine = pvporcupine.create(access_key=ACCESS_KEY, keywords=[WAKE_WORD])
-
-pa = pyaudio.PyAudio()
-stream = pa.open(
-    rate=porcupine.sample_rate,
-    channels=CHANNELS,
-    format=pyaudio.paInt16,
-    input=True,
-    frames_per_buffer=porcupine.frame_length
-)
-
-# pre-buffer de ~1 s antes del trigger
-pre_buffer_frames = deque(maxlen=int(RATE / porcupine.frame_length * 1))
 
 # -----------------------------------------------------------------------------
 # Lanzar threads
 # -----------------------------------------------------------------------------
 
 threading.Thread(target=mcp_worker, daemon=True).start()
-# threading.Thread(target=reminder_scheduler, daemon=True).start()  # <-- actívalo si quieres
+# threading.Thread(target=reminder_scheduler, daemon=True).start()  # opcional
 
 print("Listening for wake word...")
 
@@ -350,46 +394,45 @@ print("Listening for wake word...")
 
 try:
     while True:
+        # lee frame para Porcupine + prebuffer
         try:
-            pcm = stream.read(porcupine.frame_length, exception_on_overflow=False)
+            pcm = stream.read(FRAME_LEN, exception_on_overflow=False)
         except Exception as e:
             print(f"[Stream Error] {e}")
             continue
 
-        pcm_unpacked = struct.unpack_from("h" * porcupine.frame_length, pcm)
         pre_buffer_frames.append(pcm)
+        pcm_unpacked = struct.unpack_from("h" * (len(pcm)//2), pcm)
 
         if state == IDLE:
             keyword_index = porcupine.process(pcm_unpacked)
             if keyword_index >= 0:
                 print("[DETECTED] Wake word")
-
-                frames = list(pre_buffer_frames)
-                last_rec_started_at = time.time()
-                for _ in range(int(RATE / porcupine.frame_length * RECORD_SECONDS)):
-                    frames.append(stream.read(porcupine.frame_length, exception_on_overflow=False))
-                rec_dur = time.time() - last_rec_started_at
-                print(f"[REC] dur={rec_dur:.2f}s frames={len(frames)}")
-
-                save_audio_from_frames("wake_audio.wav", frames)
+                # Graba la frase con VAD (incluye 1s pre-roll)
+                frames, dur = record_utterance_vad(prebuffer=pre_buffer_frames)
+                print(f"[REC] wake dur={dur:.2f}s frames={len(frames)}")
+                save_audio_from_frames("wake_audio.wav", frames, SAMPLE_RATE)
                 print("[REC] archivo= wake_audio.wav; subiendo…")
                 QUEUE.put(("wake_audio.wav", True))
+                # NOTA: el estado se actualiza en el worker tras reproducir respuesta
 
         elif state in (CONVERSATION_ACTIVE, WAITING_FOR_CONFIRMATION):
-            if time.time() - last_activity_time > 10:
-                state = IDLE
-            else:
-                frames = []
-                last_rec_started_at = time.time()
-                for _ in range(int(RATE / porcupine.frame_length * RECORD_SECONDS)):
-                    frames.append(stream.read(porcupine.frame_length, exception_on_overflow=False))
-                rec_dur = time.time() - last_rec_started_at
-                print(f"[REC] (follow-up) dur={rec_dur:.2f}s frames={len(frames)}")
+            # Anti-rebote para no spamear
+            if last_followup_sent_at and (time.time() - last_followup_sent_at) < FOLLOWUP_COOLDOWN_S:
+                continue
 
-                save_audio_from_frames("followup.wav", frames)
+            # Espera voz y graba follow-up con VAD
+            frames, dur = wait_for_speech_then_record_vad(timeout_s=FOLLOWUP_LISTEN_WINDOW_S)
+            if frames:
+                print(f"[REC] follow-up dur={dur:.2f}s frames={len(frames)}")
+                save_audio_from_frames("followup.wav", frames, SAMPLE_RATE)
                 print("[REC] archivo= followup.wav; subiendo…")
                 QUEUE.put(("followup.wav", True))
                 last_activity_time = time.time()
+                last_followup_sent_at = time.time()
+            else:
+                # No hubo habla en ventana -> volver a IDLE
+                state = IDLE
 
 except KeyboardInterrupt:
     print("\nShutting down...")
