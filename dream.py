@@ -200,7 +200,6 @@ def play_response_bytes(resp_bytes: bytes, content_type: str | None):
 
 WAKE_DIR = os.path.join(BASE_DIR, "Wakewords")
 KEYWORD_PATH = os.path.join(WAKE_DIR, "Hey-Dream_en_raspberry-pi_v3_0_0.ppn")  
-# Si el ambiente es español, usa el modelo ES; si no, el default EN:
 
 porcupine = pvporcupine.create(
     access_key=ACCESS_KEY,
