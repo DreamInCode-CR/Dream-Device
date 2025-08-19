@@ -205,7 +205,7 @@ KEYWORD_PATH = os.path.join(WAKE_DIR, "dream_raspberry-pi.ppn")
 porcupine = pvporcupine.create(
     access_key=ACCESS_KEY,
     keyword_paths=[KEYWORD_PATH],
-    sensitivities=[0.6],   # 0–1 (más alto = más sensible = más falsos positivos)
+    sensitivities=[0.6]   # 0–1 (más alto = más sensible = más falsos positivos)
 )
 SAMPLE_RATE = porcupine.sample_rate        # 16000
 FRAME_LEN = porcupine.frame_length         # típicamente 512
