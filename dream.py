@@ -362,7 +362,7 @@ def reminder_scheduler():
 
             if r.status_code == 404:
                 # No hay medicamento en ventana de 5 min
-                # print("[REMINDER] 404 (no due meds ahora)")
+                print("[REMINDER] 404 (no due meds ahora)")
                 time.sleep(60)
                 continue
 
