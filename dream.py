@@ -5,6 +5,7 @@ import wave
 import queue
 import struct
 import threading
+import shutil
 from collections import deque
 from datetime import datetime
 
@@ -15,7 +16,6 @@ import requests
 # === Audio decode / convert ===
 from pydub import AudioSegment
 import tempfile
-import subprocess  # para reproducir audio de espera en loop (ahora 1 sola vez)
 import statistics
 
 # -----------------------------------------------------------------------------
@@ -42,8 +42,8 @@ FOLLOWUP_COOLDOWN_S = 0.8      # anti rebote tras enviar un followup
 
 # Estados
 IDLE = "IDLE"
-WAITING_FOR_SPEECH = "WAITING_FOR_SPEECH"      # esperando voz del usuario
-CONVERSATION_ACTIVE = "CONVERSATION_ACTIVE"    # hubo respuesta TTS; podemos escuchar follow-ups
+WAITING_FOR_SPEECH = "WAITING_FOR_SPEECH"
+CONVERSATION_ACTIVE = "CONVERSATION_ACTIVE"
 WAITING_FOR_CONFIRMATION = "WAITING_FOR_CONFIRMATION"
 state = IDLE
 last_activity_time = time.time()
@@ -69,7 +69,7 @@ except Exception:
     pass
 
 # -----------------------------------------------------------------------------
-# Audio local de espera
+# Audio local de espera (una sola vez por petición)
 # -----------------------------------------------------------------------------
 try:
     BASE_DIR = os.path.dirname(os.path.abspath(_file_))
@@ -78,8 +78,8 @@ except NameError:
 
 WAIT_AUDIO_PATH = os.path.join(BASE_DIR, "PrefabAudios", "waitResponse.wav")
 
-def play_audio(filename):
-    os.system(f"aplay '{filename}' >/dev/null 2>&1")
+def play_wav(path: str):
+    os.system(f"aplay -q '{path}' >/dev/null 2>&1")
 
 def _normalize_wait_wav(src_path: str) -> str:
     audio = AudioSegment.from_file(src_path)
@@ -99,21 +99,6 @@ if os.path.exists(WAIT_AUDIO_PATH):
 else:
     print(f"[WAIT] Archivo no encontrado: {WAIT_AUDIO_PATH}")
 
-# --- NUEVO: reproducción de espera SOLO UNA VEZ (no loop) ---
-def play_wait_once(file_path: str):
-    """Devuelve el proceso de aplay para poder cortarlo si la respuesta llega antes."""
-    if not os.path.exists(file_path):
-        return None
-    try:
-        return subprocess.Popen(
-            ["aplay", "-q", file_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-    except Exception as e:
-        print(f"[WAIT] error reproduciendo: {e}")
-        return None
-
 # -----------------------------------------------------------------------------
 # Utilidades WAV locales
 # -----------------------------------------------------------------------------
@@ -127,69 +112,74 @@ def save_audio_from_frames(filename, frames, sample_rate, sample_width=2, channe
         wf.writeframes(b''.join(frames))
 
 # -----------------------------------------------------------------------------
-# Decodificación/normalización de respuestas (backend -> reproducción rápida)
+# Reproducción robusta de respuestas del backend (sin estática)
 # -----------------------------------------------------------------------------
 
-def looks_like_mp3(buf: bytes) -> bool:
-    if len(buf) < 2:
-        return False
-    if buf[:3] == b"ID3":
-        return True
-    return buf[0] == 0xFF and (buf[1] & 0xE0) == 0xE0
+def _fmt_from_header(ct: str | None) -> str | None:
+    if not ct:
+        return None
+    c = ct.lower()
+    if "wav" in c or "wave" in c:
+        return "wav"
+    if "mpeg" in c or "mp3" in c:
+        return "mp3"
+    return None
 
-def looks_like_wav(buf: bytes) -> bool:
-    return len(buf) >= 12 and buf[:4] == b"RIFF" and buf[8:12] == b"WAVE"
+def _sniff_fmt(b: bytes) -> str | None:
+    if len(b) >= 12 and b[:4] == b"RIFF" and b[8:12] == b"WAVE":
+        return "wav"
+    if len(b) >= 2 and (b[:3] == b"ID3" or (b[0] == 0xFF and (b[1] & 0xE0) == 0xE0)):
+        return "mp3"
+    return None
 
-# --- NUEVO: reproductor “fast-path” (evita conversiones) ---
-def _write_temp(suffix: str, data: bytes) -> str:
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(data)
-        return tmp.name
+def _have_mpg123() -> bool:
+    return shutil.which("mpg123") is not None
 
-def play_response_bytes_fast(resp_bytes: bytes, content_type: str | None):
+def play_response_bytes(resp_bytes: bytes, content_type: str | None):
     """
-    Reproduce con mínima transformación:
-      - WAV -> aplay
-      - MP3 -> mpg123
-      - si no se reconoce -> último recurso pydub->wav
+    Decide el formato por Content-Type primero; si falta, 'sniff'.
+    - WAV -> guardo .wav y reproduzco con aplay
+    - MP3 -> si hay mpg123, reproduzco directo; si no, convierto a WAV con pydub+ffmpeg y aplay.
     """
-    ct = (content_type or "").lower().strip()
-    tmp_path = None
-    try:
-        # fast path por content-type
-        if "audio/wav" in ct or "audio/x-wav" in ct or ct.endswith("/wav") or "wav" in ct:
-            tmp_path = _write_temp(".wav", resp_bytes)
-            os.system(f"aplay -q '{tmp_path}' >/dev/null 2>&1")
-            return
-        if "audio/mpeg" in ct or "mp3" in ct:
-            tmp_path = _write_temp(".mp3", resp_bytes)
-            os.system(f"mpg123 -q '{tmp_path}' >/dev/null 2>&1")
-            return
+    fmt = _fmt_from_header(content_type) or _sniff_fmt(resp_bytes) or "mp3"
+    print(f"[AUDIO] CT={content_type or '-'} -> fmt={fmt} bytes={len(resp_bytes)}")
 
-        # heurística por bytes
-        if looks_like_wav(resp_bytes):
-            tmp_path = _write_temp(".wav", resp_bytes)
-            os.system(f"aplay -q '{tmp_path}' >/dev/null 2>&1")
-            return
-        if looks_like_mp3(resp_bytes):
-            tmp_path = _write_temp(".mp3", resp_bytes)
-            os.system(f"mpg123 -q '{tmp_path}' >/dev/null 2>&1")
-            return
-
-        # último recurso: convertir a wav 16k mono con pydub
-        audio = AudioSegment.from_file(io.BytesIO(resp_bytes))
-        audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
-        tmp_path = _write_temp(".wav", b"")
-        audio.export(tmp_path, format="wav", parameters=["-acodec", "pcm_s16le"])
-        os.system(f"aplay -q '{tmp_path}' >/dev/null 2>&1")
-    except Exception as e:
-        print(f"[AUDIO] Fallback por error: {e}")
-        tmp_path = _write_temp(".wav", resp_bytes)
-        os.system(f"aplay -q '{tmp_path}' >/dev/null 2>&1")
-    finally:
-        if tmp_path:
-            try: os.remove(tmp_path)
+    if fmt == "wav":
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(resp_bytes)
+            path = tmp.name
+        try:
+            play_wav(path)
+        finally:
+            try: os.remove(path)
             except Exception: pass
+        return
+
+    # MP3
+    if _have_mpg123():
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+            tmp.write(resp_bytes)
+            path = tmp.name
+        try:
+            os.system(f"mpg123 -q '{path}' >/dev/null 2>&1")
+        finally:
+            try: os.remove(path)
+            except Exception: pass
+    else:
+        # fallback: decodificar a WAV y reproducir
+        try:
+            audio = AudioSegment.from_file(io.BytesIO(resp_bytes), format="mp3")
+            audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                audio.export(tmp.name, format="wav", parameters=["-acodec", "pcm_s16le"])
+                path = tmp.name
+            play_wav(path)
+        except Exception as e:
+            print(f"[AUDIO] MP3 fallback failed ({e}); guardo como .bin por depuración")
+            with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
+                tmp.write(resp_bytes)
+                path = tmp.name
+            print(f"[AUDIO] Bytes en: {path}")
 
 # -----------------------------------------------------------------------------
 # Inicialización de Porcupine + PyAudio y calibración de ruido
@@ -241,10 +231,6 @@ pre_buffer_frames = deque(maxlen=int(SAMPLE_RATE / FRAME_LEN * 1))
 # -----------------------------------------------------------------------------
 
 def record_utterance_vad(prebuffer=None) -> tuple[list[bytes], float]:
-    """
-    Graba hasta detectar silencio de cola; requiere MIN_SPEECH_MS de voz.
-    Retorna (frames, dur_seg). frames son bytes PCM S16LE a SAMPLE_RATE.
-    """
     frames = []
     speech_ms = 0
     silence_ms = 0
@@ -276,10 +262,6 @@ def record_utterance_vad(prebuffer=None) -> tuple[list[bytes], float]:
     return frames, (time.perf_counter() - t0)
 
 def wait_for_speech_then_record_vad(timeout_s=FOLLOWUP_LISTEN_WINDOW_S) -> tuple[list[bytes], float]:
-    """
-    Espera hasta detectar voz (RMS > threshold) y luego graba con VAD.
-    Si no hay voz en 'timeout_s', retorna ([], 0.0).
-    """
     t_start = time.perf_counter()
     while (time.perf_counter() - t_start) < timeout_s:
         b = stream.read(FRAME_LEN, exception_on_overflow=False)
@@ -298,11 +280,10 @@ def mcp_worker():
     global state, last_activity_time, last_followup_sent_at
     while True:
         file_to_upload, expect_followup = QUEUE.get()
-        wait_proc = None
         try:
-            # Reproduce audio de espera UNA sola vez
+            # Audio de espera en "one shot" (no loop)
             if WAIT_AUDIO_PLAY_PATH and os.path.exists(WAIT_AUDIO_PLAY_PATH):
-                wait_proc = play_wait_once(WAIT_AUDIO_PLAY_PATH)
+                threading.Thread(target=play_wav, args=(WAIT_AUDIO_PLAY_PATH,), daemon=True).start()
 
             with open(file_to_upload, 'rb') as f:
                 t0 = time.time()
@@ -314,15 +295,9 @@ def mcp_worker():
                 )
                 rt = time.time() - t0
 
-            # corta la espera si sigue sonando
-            if wait_proc and (wait_proc.poll() is None):
-                try: wait_proc.terminate()
-                except Exception: pass
-
             if response.status_code == 200:
                 print(f"[NET] round-trip {rt:.2f}s, content-type={response.headers.get('Content-Type')}")
-                # Reproductor rápido sin conversiones pesadas
-                play_response_bytes_fast(response.content, response.headers.get("Content-Type"))
+                play_response_bytes(response.content, response.headers.get("Content-Type"))
                 print("[MCP] Got response audio, played.")
 
                 if expect_followup:
@@ -335,9 +310,6 @@ def mcp_worker():
                 print(f"[MCP ERROR] Status: {response.status_code}")
         except Exception as e:
             print(f"[MCP ERROR] {e}")
-            if wait_proc and (wait_proc.poll() is None):
-                try: wait_proc.terminate()
-                except Exception: pass
         finally:
             try:
                 os.remove(file_to_upload)
@@ -350,7 +322,6 @@ def mcp_worker():
 # -----------------------------------------------------------------------------
 
 def reminder_scheduler():
-    """Ejemplo de uso del endpoint /reminder_tts."""
     global state
     while True:
         now = datetime.now()
@@ -372,7 +343,7 @@ def reminder_scheduler():
                     rt = time.time() - t0
                     if r.status_code == 200:
                         print(f"[REMINDER] TTS ok ({rt:.2f}s) ct={r.headers.get('Content-Type')}")
-                        play_response_bytes_fast(r.content, r.headers.get("Content-Type"))
+                        play_response_bytes(r.content, r.headers.get("Content-Type"))
                         state = WAITING_FOR_CONFIRMATION
                     else:
                         print(f"[REMINDER] HTTP {r.status_code}")
