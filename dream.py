@@ -6,6 +6,7 @@ import queue
 import struct
 import threading
 import shutil
+import datetime
 from collections import deque
 from datetime import datetime
 
@@ -25,8 +26,12 @@ import statistics
 ACCESS_KEY = "heQRVcJzahp/QdflX+KJRkOr6yvkclzaAKK6fY1NEKdYwtowZocbOg=="
 
 
-VOICE_MCP_URL = "https://dreamincode-abgjgwgfckbqergq.eastus-01.azurewebsites.net/voice_mcp"
-REMINDER_TTS_URL = "https://dreamincode-abgjgwgfckbqergq.eastus-01.azurewebsites.net/reminder_tts"
+# --- ENDPOINTS (corrige esto arriba del archivo) ---
+BASE_API_URL      = "https://dreamincode-abgjgwgfckbqergq.eastus-01.azurewebsites.net"  # sin slash final
+VOICE_MCP_URL     = f"{BASE_API_URL}/voice_mcp"
+REMINDER_TTS_URL  = f"{BASE_API_URL}/reminder_tts"   # solo para recordatorios TTS
+TTS_URL           = f"{BASE_API_URL}/tts"            # TTS de texto libre
+MEDS_ALL_URL      = f"{BASE_API_URL}/meds/all"       # listado completo de medicamentos
 
 USER_ID = 3            # id del adulto mayor
 CHANNELS = 1
@@ -341,22 +346,23 @@ MEDICATIONS = []
 def fetch_medications():
     global MEDICATIONS
     try:
-        r = requests.get(
-            f"{REMINDER_TTS_URL}/meds/all",
-            params={"usuario_id": USER_ID},
-            timeout=10
-        )
+        r = requests.get(MEDS_ALL_URL, params={"usuario_id": USER_ID}, timeout=10)
         if r.status_code == 200:
-            meds = r.json().get("medications", [])
+            data = r.json()
+            # acepta varias formas: {"medications":[...]}, {"items":[...]}, o lista directa
+            if isinstance(data, dict):
+                meds = data.get("medications") or data.get("items") or []
+            else:
+                meds = data
             if isinstance(meds, list):
                 MEDICATIONS = meds
                 print(f"[MEDS] Updated medications: {len(MEDICATIONS)} items")
             else:
-                print("[MEDS] Unexpected payload shape")
+                print(f"[MEDS] Unexpected payload shape: {type(meds)}")
         else:
-            print(f"[MEDS] Failed to fetch, status {r.status_code}")
+            print(f"[MEDS] Failed to fetch {MEDS_ALL_URL}, status {r.status_code} -> {r.text[:160]}")
     except Exception as e:
-        print(f"[MEDS] Error fetching medications: {e}")
+        print(f"[MEDS] Error fetching medications: {e}")
 
 
 def medication_refresher():
@@ -366,20 +372,15 @@ def medication_refresher():
 
 def speak(text: str):
     try:
-        # If your backend expects a different JSON schema, adjust here.
-        r = requests.post(
-            REMINDER_TTS_URL,
-            json={"usuario_id": USER_ID, "texto": text},
-            timeout=30
-        )
+        r = requests.post(TTS_URL, json={"texto": text}, timeout=30)
         if r.status_code == 200:
             play_response_bytes(r.content, r.headers.get("Content-Type"))
         else:
-            print(f"[SPEAK] HTTP {r.status_code}: {r.text[:120]}")
+            print(f"[SPEAK] HTTP {r.status_code}: {r.text[:160]}")
     except Exception as e:
-        print(f"[SPEAK] error: {e}")
+        print(f"[SPEAK] error: {e}")
 
-import datetime
+
 
 def reminder_scheduler():
     while True:
