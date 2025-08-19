@@ -30,6 +30,7 @@ VOICE_MCP_URL      = f"{API_BASE_URL}/voice_mcp"
 REMINDER_TTS_URL   = f"{API_BASE_URL}/reminder_tts"   # recordatorio (auto/manual)
 TTS_URL            = f"{API_BASE_URL}/tts"            # TTS libre
 MEDS_ALL_URL       = f"{API_BASE_URL}/meds/all"       # listado total (JSON)
+CONFIRM_URL        = f"{API_BASE_URL}/confirm_intake" # confirmación sí/no
 
 USER_ID = 3            # id del adulto mayor
 CHANNELS = 1
@@ -40,8 +41,12 @@ QUEUE = queue.Queue()
 MIN_SPEECH_MS = 500            # mínimo de voz acumulada para considerar "frase" válida
 TRAILING_SILENCE_MS = 700      # silencio para cortar al final
 MAX_UTTERANCE_S = 8            # tope duro por utterance
-FOLLOWUP_LISTEN_WINDOW_S = 10  # ventana para esperar que el usuario empiece a hablar
+FOLLOWUP_LISTEN_WINDOW_S = 10  # ventana para follow-ups
 FOLLOWUP_COOLDOWN_S = 0.8      # anti rebote tras enviar un followup
+
+# Confirmación de toma tras recordatorio
+CONFIRM_LISTEN_WINDOW_S = 12   # esperamos hasta 12 s
+CONFIRM_SILENCE_REPROMPTS = 1  # re-pregunta UNA vez si no hay voz
 
 # Estados
 IDLE = "IDLE"
@@ -51,9 +56,6 @@ WAITING_FOR_CONFIRMATION = "WAITING_FOR_CONFIRMATION"
 state = IDLE
 last_activity_time = time.time()
 last_followup_sent_at = 0.0
-
-# Mediciones de tiempo
-last_rec_started_at = 0.0
 
 # -----------------------------------------------------------------------------
 # pydub/ffmpeg
@@ -195,7 +197,6 @@ def get_tz_offset_min() -> int:
 # -----------------------------------------------------------------------------
 
 WAKE_DIR = os.path.join(BASE_DIR, "Wakewords")
-# Usa tu archivo .ppn personalizado si corresponde:
 KEYWORD_PATH = os.path.join(WAKE_DIR, "Hey-Dream_en_raspberry-pi_v3_0_0.ppn")
 
 porcupine = pvporcupine.create(
@@ -299,7 +300,7 @@ def mcp_worker():
     while True:
         file_to_upload, expect_followup = QUEUE.get()
         try:
-            # Audio de espera en "one shot" (no loop)
+            # Una sola pista de espera por petición (no loop)
             if WAIT_AUDIO_PLAY_PATH and os.path.exists(WAIT_AUDIO_PLAY_PATH):
                 threading.Thread(target=play_wav, args=(WAIT_AUDIO_PLAY_PATH,), daemon=True).start()
 
@@ -336,11 +337,10 @@ def mcp_worker():
             QUEUE.task_done()
 
 # -----------------------------------------------------------------------------
-# Utilidades extra (opcional)
+# TTS libre (opcional)
 # -----------------------------------------------------------------------------
 
 def speak(text: str):
-    """TTS libre (no reminder)."""
     try:
         r = requests.post(TTS_URL, json={"texto": text}, timeout=30)
         if r.status_code == 200:
@@ -350,18 +350,67 @@ def speak(text: str):
     except Exception as e:
         print(f"[SPEAK] error: {e}")
 
-# (opcional) ver inventario de medicamentos desde API
-def fetch_medications():
-    try:
-        r = requests.get(MEDS_ALL_URL, params={"usuario_id": USER_ID}, timeout=10)
-        print(f"[MEDS] GET /meds/all -> {r.status_code}")
+# -----------------------------------------------------------------------------
+# Confirmación: escucha y envía a /confirm_intake
+# -----------------------------------------------------------------------------
+
+def _send_confirm_audio(path_wav: str, med: str, hora: str):
+    with open(path_wav, "rb") as f:
+        r = requests.post(
+            CONFIRM_URL,
+            files={"audio": (os.path.basename(path_wav), f, "audio/wav")},
+            data={"usuario_id": USER_ID, "medicamento": med, "hora": hora},
+            timeout=30
+        )
+    return r
+
+def _send_confirm_silence(med: str, hora: str):
+    # sin audio -> backend responde “No te escuché…” (audio)
+    r = requests.post(
+        CONFIRM_URL,
+        json={"usuario_id": USER_ID, "medicamento": med, "hora": hora, "texto": ""},
+        timeout=30
+    )
+    return r
+
+def confirm_after_reminder(med: str, hora: str, dosis: str):
+    """
+    Tras reproducir el reminder, escucha hasta 12s.
+    - Si hay voz: manda a /confirm_intake (audio) y reproduce su respuesta.
+    - Si no hay voz: manda request sin audio (una vez) para que re-pregunte.
+    """
+    global state
+    state = WAITING_FOR_CONFIRMATION
+
+    # 1er intento: escuchar voz
+    frames, dur = wait_for_speech_then_record_vad(timeout_s=CONFIRM_LISTEN_WINDOW_S)
+    if frames:
+        save_audio_from_frames("confirm.wav", frames, SAMPLE_RATE)
+        print(f"[CONFIRM] voz capturada ({dur:.2f}s). Enviando…")
+        r = _send_confirm_audio("confirm.wav", med, hora)
+        try:
+            os.remove("confirm.wav")
+        except Exception:
+            pass
         if r.status_code == 200:
-            data = r.json()
-            print(f"[MEDS] count={data.get('count')}")  # no se usa, sólo info
+            play_response_bytes(r.content, r.headers.get("Content-Type"))
         else:
-            print(f"[MEDS] payload: {r.text[:160]}")
-    except Exception as e:
-        print(f"[MEDS] error:", e)
+            print(f"[CONFIRM] HTTP {r.status_code}: {r.text[:160]}")
+        state = IDLE
+        return
+
+    # Sin voz → una re-pregunta
+    for _ in range(CONFIRM_SILENCE_REPROMPTS):
+        print("[CONFIRM] no hubo voz; solicitando re-pregunta…")
+        r = _send_confirm_silence(med, hora)
+        if r.status_code == 200:
+            play_response_bytes(r.content, r.headers.get("Content-Type"))
+        else:
+            print(f"[CONFIRM] HTTP {r.status_code}: {r.text[:160]}")
+        # Tras re-pregunta NO seguimos esperando indefinidamente; salimos
+        break
+
+    state = IDLE
 
 # -----------------------------------------------------------------------------
 # Poller de recordatorios (usa reminder_tts auto + tz_offset_min)
@@ -375,7 +424,21 @@ def auto_reminder_poller():
             r = requests.post(REMINDER_TTS_URL, json=payload, timeout=20)
             if r.status_code == 200:
                 print(f"[AUTO] ok tz={tz} ct={r.headers.get('Content-Type')}")
+                # reproducir recordatorio
                 play_response_bytes(r.content, r.headers.get("Content-Type"))
+
+                # extraer metadatos para confirmación (tu backend los pone)
+                med   = r.headers.get("X-Medicamento", "") or ""
+                hora  = r.headers.get("X-Hora", "") or ""
+                dosis = r.headers.get("X-Dosis", "") or ""
+
+                # lanzar confirmación en thread aparte
+                threading.Thread(
+                    target=confirm_after_reminder,
+                    args=(med, hora, dosis),
+                    daemon=True
+                ).start()
+
             elif r.status_code == 404:
                 # No hay medicamento en este minuto/ventana
                 pass
@@ -386,18 +449,31 @@ def auto_reminder_poller():
         time.sleep(30)  # consulta cada 30 s
 
 # -----------------------------------------------------------------------------
+# (opcional) inventario
+# -----------------------------------------------------------------------------
+
+def fetch_medications():
+    try:
+        r = requests.get(MEDS_ALL_URL, params={"usuario_id": USER_ID}, timeout=10)
+        print(f"[MEDS] GET /meds/all -> {r.status_code}")
+        if r.status_code == 200:
+            data = r.json()
+            print(f"[MEDS] count={data.get('count')}")
+    except Exception as e:
+        print(f"[MEDS] error:", e)
+
+# -----------------------------------------------------------------------------
 # Lanzar threads
 # -----------------------------------------------------------------------------
 
 threading.Thread(target=mcp_worker, daemon=True).start()
 threading.Thread(target=auto_reminder_poller, daemon=True).start()
-# (opcional) solo informativo:
-threading.Thread(target=fetch_medications, daemon=True).start()
+threading.Thread(target=fetch_medications, daemon=True).start()  # informativo
 
 print("Listening for wake word...")
 
 # -----------------------------------------------------------------------------
-# Bucle principal
+# Bucle principal (wake word + conversación)
 # -----------------------------------------------------------------------------
 
 try:
