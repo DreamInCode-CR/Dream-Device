@@ -3,11 +3,13 @@ import io
 import time
 import wave
 import base64
+import json
 import queue
 import struct
 import shutil
 import threading
 from collections import deque
+from datetime import datetime, date
 
 import requests
 import pyaudio
@@ -69,7 +71,7 @@ except NameError:
 
 WAIT_AUDIO_PATH = os.path.join(BASE_DIR, "PrefabAudios", "waitResponse.wav")
 
-# Cambia esta ruta por tu keyword .ppn (si no existe, se usa “porcupine” automáticamente)
+# Cambia esta ruta por tu keyword .ppn (si no existe, el script cae a "porcupine")
 WAKE_DIR = os.path.join(BASE_DIR, "Wakewords")
 KEYWORD_PATH = os.path.join(WAKE_DIR, "Hey-Dream_en_raspberry-pi_v3_0_0.ppn")  # <-- ajusta a tu .ppn real
 
@@ -289,6 +291,7 @@ def mcp_worker():
         file_to_upload, expect_followup = QUEUE.get()
         try:
             # dispara el audio de espera (una sola vez)
+            # (si no quieres el 'wait tone', comenta estas dos líneas)
             if WAIT_AUDIO_PLAY_PATH and os.path.exists(WAIT_AUDIO_PLAY_PATH):
                 threading.Thread(target=play_wav, args=(WAIT_AUDIO_PLAY_PATH,), daemon=True).start()
 
@@ -313,7 +316,7 @@ def mcp_worker():
                 else:
                     state = IDLE
             else:
-                print(f"[MCP ERROR] Status: {response.status_code}")
+                print(f"[MCP ERROR] Status: {response.status_code}  Body={response.text[:120]}")
         except Exception as e:
             print(f"[MCP ERROR] {e}")
         finally:
@@ -327,6 +330,8 @@ def mcp_worker():
 # Recordatorios con /reminder_tts (auto=true) + /confirm_intake
 # =============================================================================
 
+FIRED_KEYS = set()  # evita repetición (fecha, hh:mm, medicamento) en esta sesión
+
 def get_tz_offset_min() -> int:
     import time as _t
     if _t.localtime().tm_isdst and _t.daylight:
@@ -339,21 +344,25 @@ def reminder_scheduler():
     """
     Cada minuto:
       - POST /reminder_tts?mode=json {usuario_id, auto: true, tz_offset_min}
-      - Si 200: reproduce recordatorio (con “¿ya te la tomaste?”) y escucha tu respuesta.
-      - Envía audio a /confirm_intake y reproduce la confirmación.
+        * si devuelve 404 -> no hay medicina ahora (log y seguimos)
+        * si 200 JSON con audio_base64 -> reproducimos
+        * si 200 binario (no JSON) -> reproducimos bytes directo
+      - luego escuchamos confirmación y la enviamos a /confirm_intake
     """
     global state
     tz_off = get_tz_offset_min()
 
     while True:
         try:
-            r = requests.post(
-                REMINDER_TTS_URL + "?mode=json",
-                json={"usuario_id": USER_ID, "auto": True, "tz_offset_min": tz_off},
-                timeout=20,
-            )
+            url = REMINDER_TTS_URL + "?mode=json"
+            payload = {"usuario_id": USER_ID, "auto": True, "tz_offset_min": tz_off}
+            t0 = time.time()
+            r = requests.post(url, json=payload, timeout=25)
+            rt = time.time() - t0
 
             if r.status_code == 404:
+                # No hay medicamento en ventana de 5 min
+                # print("[REMINDER] 404 (no due meds ahora)")
                 time.sleep(60)
                 continue
 
@@ -362,29 +371,56 @@ def reminder_scheduler():
                 time.sleep(60)
                 continue
 
-            payload = r.json()
-            audio_b64 = payload.get("audio_base64")
-            audio_mime = payload.get("audio_mime", "audio/wav")
-            med_name  = payload.get("medicamento", "")
-            med_hora  = payload.get("hora", "")
+            # Intentamos JSON primero
+            played = False
+            med_name = ""
+            med_hora = ""
 
-            if not audio_b64:
-                print("[REMINDER] payload sin audio_base64")
+            try:
+                data = r.json()
+                audio_b64 = data.get("audio_base64")
+                audio_mime = data.get("audio_mime", "audio/wav")
+                med_name  = data.get("medicamento", "")
+                med_hora  = data.get("hora", "")
+
+                # Evitar repetir en el mismo minuto (por si tu backend responde 200 varios minutos)
+                key = (date.today().isoformat(), med_hora, med_name)
+                if key in FIRED_KEYS:
+                    # ya sonó este minuto/medicamento
+                    time.sleep(60)
+                    continue
+                FIRED_KEYS.add(key)
+
+                if audio_b64:
+                    print(f"[REMINDER] 200 JSON ({rt:.2f}s) mime={audio_mime} med='{med_name}' hora='{med_hora}'")
+                    play_b64_audio(audio_b64, audio_mime)
+                    played = True
+                else:
+                    print("[REMINDER] 200 JSON pero sin audio_base64; intentar binario fallback...")
+            except ValueError:
+                # No era JSON (devuelve archivo) -> reproducir bytes directo
+                pass
+
+            if not played:
+                # Fallback: tratar la respuesta como binaria (send_file)
+                print(f"[REMINDER] 200 binario ({rt:.2f}s) ct={r.headers.get('Content-Type')}")
+                play_response_bytes(r.content, r.headers.get("Content-Type"))
+                played = True
+
+            if played:
+                state = WAITING_FOR_CONFIRMATION
+            else:
                 time.sleep(60)
                 continue
 
-            # Reproduce recordatorio y pasa a esperar confirmación
-            play_b64_audio(audio_b64, audio_mime)
-            state = WAITING_FOR_CONFIRMATION
-
-            # Escucha respuesta del usuario
+            # Escucha confirmación del usuario (sí/no)
             frames, dur = wait_for_speech_then_record_vad(timeout_s=15)
             if not frames:
                 state = IDLE
                 time.sleep(60)
                 continue
 
-            # Enviar a confirm_intake
+            # Enviar audio a /confirm_intake
             tmp = "confirm.wav"
             save_audio_from_frames(tmp, frames, SAMPLE_RATE)
             try:
@@ -421,8 +457,8 @@ def reminder_scheduler():
 # Lanzar threads y bucle principal
 # =============================================================================
 
-threading.Thread(target=mcp_worker, daemon=True).start()
-threading.Thread(target=reminder_scheduler, daemon=True).start()  # activa recordatorios
+threading.Thread(target=mcp_worker, daemon=True).start()              # hilo conversación
+threading.Thread(target=reminder_scheduler, daemon=True).start()      # hilo recordatorios
 
 print("Listening for wake word...")
 
@@ -448,12 +484,10 @@ try:
                 QUEUE.put(("wake_audio.wav", True))
 
         elif state in (CONVERSATION_ACTIVE, WAITING_FOR_CONFIRMATION):
-            # anti rebote para followups
-            if (time.time() - last_activity_time) > 10:
+            if (time.time() - last_activity_time) > 10 and state == CONVERSATION_ACTIVE:
                 state = IDLE
                 continue
 
-            # sólo si estás en diálogo libre con /voice_mcp
             if state == CONVERSATION_ACTIVE:
                 frames, dur = wait_for_speech_then_record_vad(timeout_s=FOLLOWUP_LISTEN_WINDOW_S)
                 if frames:
@@ -474,7 +508,7 @@ finally:
     except Exception:
         pass
     try:
-        pa.terminate()
+        pyaudio.PyAudio().terminate()
     except Exception:
         pass
     try:
