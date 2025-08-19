@@ -52,12 +52,6 @@ last_followup_sent_at = 0.0
 # Mediciones de tiempo
 last_rec_started_at = 0.0
 
-# Agenda de ejemplo (no usada si el thread está comentado)
-MEDICATIONS = [
-    {"hour": 8, "minute": 0, "name": "blood pressure pill"},
-    {"hour": 20, "minute": 0, "name": "cholesterol tablet"},
-]
-
 # -----------------------------------------------------------------------------
 # pydub/ffmpeg
 # -----------------------------------------------------------------------------
@@ -341,42 +335,128 @@ def mcp_worker():
 # Scheduler de recordatorios (usa /reminder_tts) - opcional
 # -----------------------------------------------------------------------------
 
-def reminder_scheduler():
-    global state
+FIRED_REMINDERS = set()  
+
+MEDICATIONS = [] 
+def fetch_medications():
+    global MEDICATIONS
+    try:
+        r = requests.get(
+            f"{REMINDER_TTS_URL}/meds/all",
+            params={"usuario_id": USER_ID},
+            timeout=10
+        )
+        if r.status_code == 200:
+            meds = r.json().get("medications", [])
+            if isinstance(meds, list):
+                MEDICATIONS = meds
+                print(f"[MEDS] Updated medications: {len(MEDICATIONS)} items")
+            else:
+                print("[MEDS] Unexpected payload shape")
+        else:
+            print(f"[MEDS] Failed to fetch, status {r.status_code}")
+    except Exception as e:
+        print(f"[MEDS] Error fetching medications: {e}")
+
+
+def medication_refresher():
     while True:
-        now = datetime.now()
+        fetch_medications()
+        time.sleep(600)  # 10 minutes
+
+def speak(text: str):
+    try:
+        # If your backend expects a different JSON schema, adjust here.
+        r = requests.post(
+            REMINDER_TTS_URL,
+            json={"usuario_id": USER_ID, "texto": text},
+            timeout=30
+        )
+        if r.status_code == 200:
+            play_response_bytes(r.content, r.headers.get("Content-Type"))
+        else:
+            print(f"[SPEAK] HTTP {r.status_code}: {r.text[:120]}")
+    except Exception as e:
+        print(f"[SPEAK] error: {e}")
+
+import datetime
+
+def reminder_scheduler():
+    while True:
+        now = datetime.datetime.now()
+        weekday_en = now.strftime("%A")         # e.g. 'Monday'
+        weekday_key = {
+            "Monday": "Lunes",
+            "Tuesday": "Martes",
+            "Wednesday": "Miercoles",
+            "Thursday": "Jueves",
+            "Friday": "Viernes",
+            "Saturday": "Sabado",
+            "Sunday": "Domingo",
+        }[weekday_en]
+        today = now.date()
+        today_iso = today.isoformat()
+        current_time = now.strftime("%H:%M")
+
         for med in MEDICATIONS:
-            if now.hour == med["hour"] and now.minute == med["minute"]:
-                print(f"[REMINDER] Time to take {med['name']}")
-                try:
-                    t0 = time.time()
-                    r = requests.post(
-                        REMINDER_TTS_URL,
-                        json={
-                            "usuario_id": USER_ID,
-                            "medicamento": med["name"],
-                            "dosis": "",
-                            "hora": f"{now.hour:02d}:{now.minute:02d}",
-                        },
-                        timeout=30,
-                    )
-                    rt = time.time() - t0
-                    if r.status_code == 200:
-                        print(f"[REMINDER] TTS ok ({rt:.2f}s) ct={r.headers.get('Content-Type')}")
-                        play_response_bytes(r.content, r.headers.get("Content-Type"))
-                        state = WAITING_FOR_CONFIRMATION
-                    else:
-                        print(f"[REMINDER] HTTP {r.status_code}")
-                except Exception as e:
-                    print(f"[REMINDER] error: {e}")
-        time.sleep(60)
+            try:
+                if not med.get("Activo", True):
+                    continue
+
+                # Rango de fechas (permitir nulos)
+                start_s = med.get("FechaInicio")
+                end_s   = med.get("FechaHasta")
+                if start_s:
+                    start = datetime.date.fromisoformat(start_s)
+                    if today < start:
+                        continue
+                if end_s:
+                    end = datetime.date.fromisoformat(end_s)
+                    if today > end:
+                        continue
+
+                # Día de la semana
+                if not med.get(weekday_key, False):
+                    continue
+
+                # Hora exacta
+                if med.get("HoraToma") != current_time:
+                    continue
+
+                # Evitar repetir dentro del mismo minuto
+                med_id = med.get("MedicamentoID") or med.get("NombreMedicamento")
+                key = (today_iso, current_time, str(med_id))
+                if key in FIRED_REMINDERS:
+                    continue
+                FIRED_REMINDERS.add(key)
+
+                # Armar texto
+                name = med.get("NombreMedicamento", "tu medicamento")
+                dose = med.get("Dosis", "")
+                instructions = med.get("Instrucciones", "")
+                dose_part = f", dosis {dose}" if dose else ""
+                instr_part = f". {instructions}" if instructions else ""
+                text = f"Es hora de tomar {name}{dose_part}{instr_part}"
+
+                speak(text)
+
+            except Exception as e:
+                print(f"[REMINDER] Error processing med {med.get('MedicamentoID')}: {e}")
+
+        time.sleep(60)  # check every minute
+
+
 
 # -----------------------------------------------------------------------------
 # Lanzar threads
 # -----------------------------------------------------------------------------
 
 threading.Thread(target=mcp_worker, daemon=True).start()
-# threading.Thread(target=reminder_scheduler, daemon=True).start()  # opcional
+
+fetch_medications()
+
+threading.Thread(target=medication_refresher, daemon=True).start()
+threading.Thread(target=reminder_scheduler, daemon=True).start()
 
 print("Listening for wake word...")
 
