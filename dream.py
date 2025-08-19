@@ -23,7 +23,7 @@ import statistics
 # -----------------------------------------------------------------------------
 
 ACCESS_KEY = "heQRVcJzahp/QdflX+KJRkOr6yvkclzaAKK6fY1NEKdYwtowZocbOg=="
-WAKE_WORD = "porcupine"
+
 
 VOICE_MCP_URL = "https://dreamincode-abgjgwgfckbqergq.eastus-01.azurewebsites.net/voice_mcp"
 REMINDER_TTS_URL = "https://dreamincode-abgjgwgfckbqergq.eastus-01.azurewebsites.net/reminder_tts"
@@ -198,7 +198,15 @@ def play_response_bytes(resp_bytes: bytes, content_type: str | None):
 # Inicialización de Porcupine + PyAudio y calibración de ruido
 # -----------------------------------------------------------------------------
 
-porcupine = pvporcupine.create(access_key=ACCESS_KEY, keywords=[WAKE_WORD])
+WAKE_DIR = os.path.join(BASE_DIR, "Wakewords")
+KEYWORD_PATH = os.path.join(WAKE_DIR, "dream_raspberry-pi.ppn")  
+# Si el ambiente es español, usa el modelo ES; si no, el default EN:
+
+porcupine = pvporcupine.create(
+    access_key=ACCESS_KEY,
+    keyword_paths=[KEYWORD_PATH],
+    sensitivities=[0.6],   # 0–1 (más alto = más sensible = más falsos positivos)
+)
 SAMPLE_RATE = porcupine.sample_rate        # 16000
 FRAME_LEN = porcupine.frame_length         # típicamente 512
 FRAME_MS = int(1000 * FRAME_LEN / SAMPLE_RATE)
