@@ -1,3 +1,4 @@
+
 import os
 import io
 import time
@@ -28,8 +29,8 @@ ACCESS_KEY = "heQRVcJzahp/QdflX+KJRkOr6yvkclzaAKK6fY1NEKdYwtowZocbOg=="
 BASE_URL         = "https://dreamincode-abgjgwgfckbqergq.eastus-01.azurewebsites.net"
 VOICE_MCP_URL    = f"{BASE_URL}/voice_mcp"
 REMINDER_TTS_URL = f"{BASE_URL}/reminder_tts"
-MEDS_ALL_URL     = f"{BASE_URL}/meds/all"   # <-- para fetch_medications()
-TTS_URL          = f"{BASE_URL}/tts"        # <-- para speak()
+MEDS_ALL_URL     = f"{BASE_URL}/meds/all"   # <- devuelve {"items":[...]}
+TTS_URL          = f"{BASE_URL}/tts"
 
 USER_ID = 3            # id del adulto mayor
 CHANNELS = 1
@@ -37,11 +38,16 @@ RATE = 16000          # destino para normalización / guardado WAV
 QUEUE = queue.Queue()
 
 # VAD / conversación
-MIN_SPEECH_MS = 500            # mínimo de voz acumulada para considerar "frase" válida
-TRAILING_SILENCE_MS = 700      # silencio para cortar al final
-MAX_UTTERANCE_S = 8            # tope duro por utterance
-FOLLOWUP_LISTEN_WINDOW_S = 10  # ventana para esperar que el usuario empiece a hablar
-FOLLOWUP_COOLDOWN_S = 0.8      # anti rebote tras enviar un followup
+MIN_SPEECH_MS = 500
+TRAILING_SILENCE_MS = 700
+MAX_UTTERANCE_S = 8
+FOLLOWUP_LISTEN_WINDOW_S = 10
+FOLLOWUP_COOLDOWN_S = 0.8
+
+# Scheduler
+CHECK_INTERVAL_S = 60           # revisión cada minuto
+MATCH_TOLERANCE_MIN = 1         # tolerancia ±1 minuto para disparar
+TEST_REMINDER_ON_START = False  # pon True para probar un recordatorio al arrancar
 
 # Estados
 IDLE = "IDLE"
@@ -51,9 +57,6 @@ WAITING_FOR_CONFIRMATION = "WAITING_FOR_CONFIRMATION"
 state = IDLE
 last_activity_time = time.time()
 last_followup_sent_at = 0.0
-
-# Mediciones de tiempo
-last_rec_started_at = 0.0
 
 # -----------------------------------------------------------------------------
 # pydub/ffmpeg
@@ -101,7 +104,6 @@ else:
 # -----------------------------------------------------------------------------
 
 def save_audio_from_frames(filename, frames, sample_rate, sample_width=2, channels=1):
-    """Guarda frames PCM (bytes) como WAV."""
     with wave.open(filename, 'wb') as wf:
         wf.setnchannels(channels)
         wf.setsampwidth(sample_width)
@@ -130,16 +132,10 @@ def _sniff_fmt(b: bytes) -> str | None:
     return None
 
 def _have_mpg123() -> bool:
-    return shutil.which("mpg123") is not None
+    import shutil as _sh
+    return _sh.which("mpg123") is not None
 
 def play_response_bytes(resp_bytes: bytes, content_type: str | None):
-    """
-    Robust audio playback:
-    - Sniff bytes first to detect actual format (wav/mp3).
-    - If mismatch with Content-Type, prefer sniff.
-    - WAV: reproducir tal cual.
-    - MP3: si hay mpg123 usarlo; si no, decodificar con pydub -> WAV 16k.
-    """
     sniff_fmt = _sniff_fmt(resp_bytes)
     header_fmt = _fmt_from_header(content_type)
     fmt = sniff_fmt or header_fmt
@@ -174,7 +170,6 @@ def play_response_bytes(resp_bytes: bytes, content_type: str | None):
                 os.remove(path)
 
         else:
-            # fallback: forzar decodificación (maneja headers incorrectos)
             audio = AudioSegment.from_file(io.BytesIO(resp_bytes))
             audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -199,10 +194,10 @@ KEYWORD_PATH = os.path.join(WAKE_DIR, "Hey-Dream_en_raspberry-pi_v3_0_0.ppn")  #
 porcupine = pvporcupine.create(
     access_key=ACCESS_KEY,
     keyword_paths=[KEYWORD_PATH],
-    sensitivities=[0.65]   # 0–1 (más alto = más sensible = más falsos positivos)
+    sensitivities=[0.65]
 )
-SAMPLE_RATE = porcupine.sample_rate        # 16000
-FRAME_LEN = porcupine.frame_length         # típicamente 512
+SAMPLE_RATE = porcupine.sample_rate
+FRAME_LEN = porcupine.frame_length
 FRAME_MS = int(1000 * FRAME_LEN / SAMPLE_RATE)
 
 pa = pyaudio.PyAudio()
@@ -232,13 +227,12 @@ def calibrate_noise(frames=50) -> float:
         b = stream.read(FRAME_LEN, exception_on_overflow=False)
         vals.append(_rms_int16(b))
     med = statistics.median(vals)
-    thr = max(300.0, med * 3.0)  # suelo 300 y 3x del piso
+    thr = max(300.0, med * 3.0)
     print(f"[VAD] noise median={med:.1f} -> threshold={thr:.1f}")
     return thr
 
 ENERGY_THRESHOLD = calibrate_noise()
 
-# pre-buffer ~1s para la frase tras el wake-word
 pre_buffer_frames = deque(maxlen=int(SAMPLE_RATE / FRAME_LEN * 1))
 
 # -----------------------------------------------------------------------------
@@ -296,7 +290,7 @@ def mcp_worker():
     while True:
         file_to_upload, expect_followup = QUEUE.get()
         try:
-            # Audio de espera en "one shot" (no loop)
+            # SINGLE SHOT de audio de “espere…”
             if WAIT_AUDIO_PLAY_PATH and os.path.exists(WAIT_AUDIO_PLAY_PATH):
                 threading.Thread(target=play_wav, args=(WAIT_AUDIO_PLAY_PATH,), daemon=True).start()
 
@@ -322,7 +316,7 @@ def mcp_worker():
                 else:
                     state = IDLE
             else:
-                print(f"[MCP ERROR] Status: {response.status_code}")
+                print(f"[MCP ERROR] Status: {response.status_code} body={response.text[:200]}")
         except Exception as e:
             print(f"[MCP ERROR] {e}")
         finally:
@@ -333,20 +327,17 @@ def mcp_worker():
             QUEUE.task_done()
 
 # -----------------------------------------------------------------------------
-# Scheduler de recordatorios (usa /meds/all + /tts)
+# Scheduler de recordatorios (usa /meds/all + /reminder_tts)
 # -----------------------------------------------------------------------------
 
 FIRED_REMINDERS = set()
 MEDICATIONS: list[dict] = []
 
 def fetch_medications():
+    """Carga todas las meds del usuario desde /meds/all."""
     global MEDICATIONS
     try:
-        r = requests.get(
-            MEDS_ALL_URL,                     # <-- raíz correcta
-            params={"usuario_id": USER_ID},
-            timeout=10
-        )
+        r = requests.get(MEDS_ALL_URL, params={"usuario_id": USER_ID}, timeout=10)
         if r.status_code == 200:
             payload = r.json()
             meds = payload.get("items", []) or payload.get("medications", [])
@@ -354,114 +345,142 @@ def fetch_medications():
                 MEDICATIONS = meds
                 print(f"[MEDS] Updated medications: {len(MEDICATIONS)} items")
             else:
-                print("[MEDS] Unexpected payload shape")
+                print(f"[MEDS] Unexpected payload: {payload.keys()}")
         else:
-            print(f"[MEDS] Failed to fetch, status {r.status_code}, body={r.text[:200]}")
+            print(f"[MEDS] Failed to fetch: {r.status_code} body={r.text[:200]}")
     except Exception as e:
         print(f"[MEDS] Error fetching medications: {e}")
 
 def medication_refresher():
     while True:
         fetch_medications()
-        time.sleep(600)  # 10 minutes
+        time.sleep(600)
 
-def speak(text: str):
+def _hhmm_to_minutes(s: str) -> int:
+    h, m = s.split(":")
+    return int(h) * 60 + int(m)
+
+def _today_flag_key() -> str:
+    # Devuelve 'Lunes'...'Domingo'
+    return {
+        "Monday": "Lunes",
+        "Tuesday": "Martes",
+        "Wednesday": "Miercoles",
+        "Thursday": "Jueves",
+        "Friday": "Viernes",
+        "Saturday": "Sabado",
+        "Sunday": "Domingo",
+    }[datetime.now().strftime("%A")]
+
+def _play_reminder_via_backend(med: dict, now_hhmm: str):
+    """Llama a /reminder_tts con los datos completos (tu flujo de servidor)."""
+    nombre = med.get("NombreMedicamento", "tu medicamento")
+    dosis  = med.get("Dosis", "") or ""
     try:
+        print(f"[AUTO] POST /reminder_tts medicamento='{nombre}' hora='{now_hhmm}'")
         r = requests.post(
-            TTS_URL,                          # <-- usar /tts
-            json={"texto": text},
+            REMINDER_TTS_URL,
+            json={
+                "usuario_id": USER_ID,
+                "auto": False,
+                "medicamento": nombre,
+                "dosis": dosis,
+                "hora": now_hhmm
+            },
             timeout=30
         )
         if r.status_code == 200:
+            print(f"[AUTO] ok ct={r.headers.get('Content-Type')}")
             play_response_bytes(r.content, r.headers.get("Content-Type"))
         else:
-            print(f"[SPEAK] HTTP {r.status_code}: {r.text[:120]}")
+            print(f"[AUTO] HTTP {r.status_code} body={r.text[:200]}")
     except Exception as e:
-        print(f"[SPEAK] error: {e}")
-
-import datetime as _dt
+        print(f"[AUTO] error: {e}")
 
 def reminder_scheduler():
+    """Evalúa cada minuto y dispara recordatorios que coincidan."""
     while True:
-        now = _dt.datetime.now()
-        weekday_en = now.strftime("%A")         # e.g. 'Monday'
-        weekday_key = {
-            "Monday": "Lunes",
-            "Tuesday": "Martes",
-            "Wednesday": "Miercoles",
-            "Thursday": "Jueves",
-            "Friday": "Viernes",
-            "Saturday": "Sabado",
-            "Sunday": "Domingo",
-        }[weekday_en]
-        today = now.date()
-        today_iso = today.isoformat()
-        current_time = now.strftime("%H:%M")
+        now = datetime.now()
+        now_hhmm = now.strftime("%H:%M")
+        today_key = _today_flag_key()
+        now_min = now.hour * 60 + now.minute
+
+        print(f"[SCHED] tick now={now.isoformat(timespec='seconds')} ({today_key}) — meds={len(MEDICATIONS)}")
 
         for med in MEDICATIONS:
             try:
-                if not med.get("Activo", True):
+                mid = med.get("MedicamentoID") or med.get("NombreMedicamento")
+                hora = (med.get("HoraToma") or "").strip()
+                activo = bool(med.get("Activo", True))
+
+                # Logs de evaluación
+                print(f"  [CHK] id={mid} activo={activo} HoraToma='{hora}' "
+                      f"dias={{Lu:{med.get('Lunes')}, Ma:{med.get('Martes')}, Mi:{med.get('Miercoles')}, "
+                      f"Ju:{med.get('Jueves')}, Vi:{med.get('Viernes')}, Sa:{med.get('Sabado')}, Do:{med.get('Domingo')}}}")
+
+                if not activo or not hora or not med.get(today_key, False):
                     continue
 
-                # Rango de fechas (permitir nulos)
-                start_s = med.get("FechaInicio")
-                end_s   = med.get("FechaHasta")
-                if start_s:
-                    start = _dt.date.fromisoformat(start_s)
-                    if today < start:
+                med_min = _hhmm_to_minutes(hora)
+                diff = abs(med_min - now_min)
+
+                if diff <= MATCH_TOLERANCE_MIN:
+                    key = (now.date().isoformat(), hora, str(mid))
+                    if key in FIRED_REMINDERS:
+                        print(f"  [SKIP] already fired {key}")
                         continue
-                if end_s:
-                    end = _dt.date.fromisoformat(end_s)
-                    if today > end:
-                        continue
 
-                # Día de la semana
-                if not med.get(weekday_key, False):
-                    continue
-
-                # Hora exacta
-                if med.get("HoraToma") != current_time:
-                    continue
-
-                # Evitar repetir dentro del mismo minuto
-                med_id = med.get("MedicamentoID") or med.get("NombreMedicamento")
-                key = (today_iso, current_time, str(med_id))
-                if key in FIRED_REMINDERS:
-                    continue
-                FIRED_REMINDERS.add(key)
-
-                # Armar texto
-                name = med.get("NombreMedicamento", "tu medicamento")
-                dose = med.get("Dosis", "")
-                instructions = med.get("Instrucciones", "")
-                dose_part = f", dosis {dose}" if dose else ""
-                instr_part = f". {instructions}" if instructions else ""
-                text = f"Es hora de tomar {name}{dose_part}{instr_part}"
-
-                speak(text)
+                    FIRED_REMINDERS.add(key)
+                    print(f"  [FIRE] {mid} @ {hora} (diff={diff}min) -> /reminder_tts")
+                    _play_reminder_via_backend(med, now_hhmm)
 
             except Exception as e:
-                print(f"[REMINDER] Error processing med {med.get('MedicamentoID')}: {e}")
+                print(f"[SCHED] error with med {med}: {e}")
 
-        time.sleep(60)  # check every minute
+        time.sleep(CHECK_INTERVAL_S)
 
 # -----------------------------------------------------------------------------
 # Lanzar threads
 # -----------------------------------------------------------------------------
 
-threading.Thread(target=mcp_worker, daemon=True).start()
+def mcp_worker_thread():
+    threading.Thread(target=mcp_worker, daemon=True).start()
 
-fetch_medications()
-threading.Thread(target=medication_refresher, daemon=True).start()
-threading.Thread(target=reminder_scheduler, daemon=True).start()
+def sched_threads():
+    fetch_medications()
+    threading.Thread(target=medication_refresher, daemon=True).start()
+    threading.Thread(target=reminder_scheduler, daemon=True).start()
 
-print("Listening for wake word...")
+def self_test_reminder():
+    """Opcional: dispara una prueba al arrancar para verificar audio."""
+    if not TEST_REMINDER_ON_START:
+        return
+    fake_med = {
+        "MedicamentoID": "TEST",
+        "NombreMedicamento": "pastilla de prueba",
+        "Dosis": "1",
+        "Activo": True,
+        "Lunes": True, "Martes": True, "Miercoles": True, "Jueves": True,
+        "Viernes": True, "Sabado": True, "Domingo": True,
+        "HoraToma": datetime.now().strftime("%H:%M"),
+    }
+    print("[TEST] Lanzando recordatorio de prueba…")
+    _play_reminder_via_backend(fake_med, fake_med["HoraToma"])
 
 # -----------------------------------------------------------------------------
-# Bucle principal
+# Bucle principal (wake word + VAD)
 # -----------------------------------------------------------------------------
 
-try:
+def main():
+    global state, last_followup_sent_at
+
+    # 1) Threads
+    mcp_worker_thread()
+    sched_threads()
+    self_test_reminder()
+
+    print("Listening for wake word...")
+
     while True:
         try:
             pcm = stream.read(FRAME_LEN, exception_on_overflow=False)
@@ -492,21 +511,23 @@ try:
                 save_audio_from_frames("followup.wav", frames, SAMPLE_RATE)
                 print("[REC] archivo= followup.wav; subiendo…")
                 QUEUE.put(("followup.wav", True))
-                last_activity_time = time.time()
                 last_followup_sent_at = time.time()
             else:
                 state = IDLE
 
-except KeyboardInterrupt:
-    print("\nShutting down...")
-finally:
+if __name__ == "_main_":
     try:
-        stream.stop_stream()
-        stream.close()
-    except Exception:
-        pass
-    pa.terminate()
-    try:
-        porcupine.delete()
-    except Exception:
-        pass
+        main()
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+    finally:
+        try:
+            stream.stop_stream()
+            stream.close()
+        except Exception:
+            pass
+        pa.terminate()
+        try:
+            porcupine.delete()
+        except Exception:
+            pass
