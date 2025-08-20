@@ -30,6 +30,7 @@ VOICE_MCP_URL      = f"{API_BASE_URL}/voice_mcp"
 REMINDER_TTS_URL   = f"{API_BASE_URL}/reminder_tts"   # recordatorio (auto/manual)
 TTS_URL            = f"{API_BASE_URL}/tts"            # TTS libre
 MEDS_ALL_URL       = f"{API_BASE_URL}/meds/all"       # listado total (JSON)
+STT_URL            = f"{API_BASE_URL}/stt"            # << NUEVO: STT para confirmar sí/no
 
 USER_ID = 3            # id del adulto mayor
 CHANNELS = 1
@@ -69,7 +70,7 @@ except Exception:
 # Audio local de espera (una sola vez por petición)
 # -----------------------------------------------------------------------------
 try:
-    BASE_DIR = os.path.dirname(os.path.abspath(file))
+    BASE_DIR = os.path.dirname(os.path.abspath(_file_))  # si falla, abajo cae a cwd
 except NameError:
     BASE_DIR = os.getcwd()
 
@@ -194,6 +195,11 @@ def get_tz_offset_min() -> int:
 # Inicialización de Porcupine + PyAudio y calibración de ruido
 # -----------------------------------------------------------------------------
 
+try:
+    BASE_DIR
+except NameError:
+    BASE_DIR = os.getcwd()
+
 WAKE_DIR = os.path.join(BASE_DIR, "Wakewords")
 # Usa tu archivo .ppn personalizado si corresponde:
 KEYWORD_PATH = os.path.join(WAKE_DIR, "Hey-Dream_en_raspberry-pi_v3_0_0.ppn")
@@ -291,6 +297,54 @@ def wait_for_speech_then_record_vad(timeout_s=FOLLOWUP_LISTEN_WINDOW_S) -> tuple
     return [], 0.0
 
 # -----------------------------------------------------------------------------
+# STT + clasificación local de confirmación (SÍ/NO)
+# -----------------------------------------------------------------------------
+
+def stt_transcribe_wav(path: str) -> str:
+    try:
+        with open(path, "rb") as f:
+            r = requests.post(
+                STT_URL,
+                files={'audio': (os.path.basename(path), f, 'audio/wav')},
+                data={"usuario_id": USER_ID, "lang": "es"},
+                timeout=30
+            )
+        if r.status_code == 200:
+            data = r.json()
+            return (data.get("transcripcion") or "").strip()
+        else:
+            print(f"[STT] HTTP {r.status_code}: {r.text[:160]}")
+            return ""
+    except Exception as e:
+        print(f"[STT] error: {e}")
+        return ""
+
+def classify_confirmation_local(text: str) -> str:
+    """
+    Devuelve 'yes' | 'no' | 'unsure' con reglas simples en español.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return "unsure"
+    yes_words = [
+        "sí", "si", "ya", "claro", "por supuesto", "listo", "hecho",
+        "me la tomé", "me la tome", "ya la tomé", "ya la tome",
+        "ya lo hice", "la tomé", "la tome"
+    ]
+    no_words = [
+        "no", "todavía no", "aún no", "aun no", "después", "luego",
+        "más tarde", "mas tarde", "no la tomé", "no la tome",
+        "no lo hice"
+    ]
+    for w in yes_words:
+        if w in t:
+            return "yes"
+    for w in no_words:
+        if w in t:
+            return "no"
+    return "unsure"
+
+# -----------------------------------------------------------------------------
 # Worker: envía audio al backend y reproduce la respuesta
 # -----------------------------------------------------------------------------
 
@@ -368,6 +422,7 @@ def fetch_medications():
 # -----------------------------------------------------------------------------
 
 def auto_reminder_poller():
+    global state
     while True:
         try:
             tz = get_tz_offset_min()
@@ -376,6 +431,8 @@ def auto_reminder_poller():
             if r.status_code == 200:
                 print(f"[AUTO] ok tz={tz} ct={r.headers.get('Content-Type')}")
                 play_response_bytes(r.content, r.headers.get("Content-Type"))
+                # tras sonar el recordatorio, pasar a esperar confirmación
+                state = WAITING_FOR_CONFIRMATION
             elif r.status_code == 404:
                 # No hay medicamento en este minuto/ventana
                 pass
@@ -421,7 +478,7 @@ try:
                 print("[REC] archivo= wake_audio.wav; subiendo…")
                 QUEUE.put(("wake_audio.wav", True))
 
-        elif state in (CONVERSATION_ACTIVE, WAITING_FOR_CONFIRMATION):
+        elif state == CONVERSATION_ACTIVE:
             if last_followup_sent_at and (time.time() - last_followup_sent_at) < FOLLOWUP_COOLDOWN_S:
                 continue
 
@@ -434,6 +491,35 @@ try:
                 last_activity_time = time.time()
                 last_followup_sent_at = time.time()
             else:
+                state = IDLE
+
+        elif state == WAITING_FOR_CONFIRMATION:
+            # Espera una respuesta corta del usuario (sí/no) y clasifica
+            print("[CONFIRM] Esperando confirmación de toma (sí/no)…")
+            frames, dur = wait_for_speech_then_record_vad(timeout_s=12)
+            if frames:
+                print(f"[CONFIRM] captura dur={dur:.2f}s frames={len(frames)}")
+                tmpf = "confirm.wav"
+                save_audio_from_frames(tmpf, frames, SAMPLE_RATE)
+                text = stt_transcribe_wav(tmpf)
+                print(f"[CONFIRM] transcript='{text}'")
+                try:
+                    os.remove(tmpf)
+                except Exception:
+                    pass
+
+                intent = classify_confirmation_local(text)
+                if intent == "yes":
+                    speak("Perfecto. He registrado que tomaste tu medicamento. ¡Bien hecho!")
+                elif intent == "no":
+                    speak("De acuerdo. Te recordaré más tarde. Por favor, no lo olvides.")
+                else:
+                    speak("No te escuché bien. ¿La tomaste? Responde sí o no.")
+
+                state = IDLE
+            else:
+                # No habló: salir de confirmación para no bloquear
+                print("[CONFIRM] no se detectó respuesta; vuelvo a IDLE")
                 state = IDLE
 
 except KeyboardInterrupt:
