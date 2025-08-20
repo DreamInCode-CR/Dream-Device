@@ -30,7 +30,7 @@ VOICE_MCP_URL      = f"{API_BASE_URL}/voice_mcp"
 REMINDER_TTS_URL   = f"{API_BASE_URL}/reminder_tts"   # recordatorio (auto/manual)
 TTS_URL            = f"{API_BASE_URL}/tts"            # TTS libre
 MEDS_ALL_URL       = f"{API_BASE_URL}/meds/all"       # listado total (JSON)
-STT_URL            = f"{API_BASE_URL}/stt"            # << NUEVO: STT para confirmar sí/no
+STT_URL            = f"{API_BASE_URL}/stt"            # STT para confirmar sí/no
 
 USER_ID = 3            # id del adulto mayor
 CHANNELS = 1
@@ -56,6 +56,10 @@ last_followup_sent_at = 0.0
 # Mediciones de tiempo
 last_rec_started_at = 0.0
 
+# Candado para no repetir el mismo reminder durante un rato
+REMINDER_LOCK_UNTIL = 0.0          # epoch seconds; si ahora < lock -> no lanzar reminder
+REMINDER_LOCK_SECS  = 120.0        # 2 minutos de supresión
+
 # -----------------------------------------------------------------------------
 # pydub/ffmpeg
 # -----------------------------------------------------------------------------
@@ -70,7 +74,7 @@ except Exception:
 # Audio local de espera (una sola vez por petición)
 # -----------------------------------------------------------------------------
 try:
-    BASE_DIR = os.path.dirname(os.path.abspath(_file_))  # si falla, abajo cae a cwd
+    BASE_DIR = os.path.dirname(os.path.abspath(_file_))
 except NameError:
     BASE_DIR = os.getcwd()
 
@@ -195,19 +199,13 @@ def get_tz_offset_min() -> int:
 # Inicialización de Porcupine + PyAudio y calibración de ruido
 # -----------------------------------------------------------------------------
 
-try:
-    BASE_DIR
-except NameError:
-    BASE_DIR = os.getcwd()
-
 WAKE_DIR = os.path.join(BASE_DIR, "Wakewords")
-# Usa tu archivo .ppn personalizado si corresponde:
 KEYWORD_PATH = os.path.join(WAKE_DIR, "Hey-Dream_en_raspberry-pi_v3_0_0.ppn")
 
 porcupine = pvporcupine.create(
     access_key=ACCESS_KEY,
     keyword_paths=[KEYWORD_PATH],
-    sensitivities=[0.65]   # 0–1 (más alto = más sensible = más falsos positivos)
+    sensitivities=[0.65]
 )
 
 SAMPLE_RATE = porcupine.sample_rate        # 16000
@@ -404,27 +402,32 @@ def speak(text: str):
     except Exception as e:
         print(f"[SPEAK] error: {e}")
 
-# (opcional) ver inventario de medicamentos desde API
 def fetch_medications():
     try:
         r = requests.get(MEDS_ALL_URL, params={"usuario_id": USER_ID}, timeout=10)
         print(f"[MEDS] GET /meds/all -> {r.status_code}")
         if r.status_code == 200:
             data = r.json()
-            print(f"[MEDS] count={data.get('count')}")  # no se usa, sólo info
+            print(f"[MEDS] count={data.get('count')}")
         else:
             print(f"[MEDS] payload: {r.text[:160]}")
     except Exception as e:
         print(f"[MEDS] error:", e)
 
 # -----------------------------------------------------------------------------
-# Poller de recordatorios (usa reminder_tts auto + tz_offset_min)
+# Poller de recordatorios (usa reminder_tts auto + tz_offset_min) con candado
 # -----------------------------------------------------------------------------
 
 def auto_reminder_poller():
-    global state
+    global state, REMINDER_LOCK_UNTIL
     while True:
         try:
+            now = time.time()
+            # Si aún estamos en ventana de supresión, o esperando confirmación, no pidas nada
+            if now < REMINDER_LOCK_UNTIL or state == WAITING_FOR_CONFIRMATION:
+                time.sleep(1.0)
+                continue
+
             tz = get_tz_offset_min()
             payload = {"usuario_id": USER_ID, "auto": True, "tz_offset_min": tz}
             r = requests.post(REMINDER_TTS_URL, json=payload, timeout=20)
@@ -433,6 +436,8 @@ def auto_reminder_poller():
                 play_response_bytes(r.content, r.headers.get("Content-Type"))
                 # tras sonar el recordatorio, pasar a esperar confirmación
                 state = WAITING_FOR_CONFIRMATION
+                # activar candado para no repetir reminder dentro de la ventana
+                REMINDER_LOCK_UNTIL = time.time() + REMINDER_LOCK_SECS
             elif r.status_code == 404:
                 # No hay medicamento en este minuto/ventana
                 pass
@@ -440,7 +445,7 @@ def auto_reminder_poller():
                 print(f"[AUTO] HTTP {r.status_code}: {r.text[:160]}")
         except Exception as e:
             print(f"[AUTO] error: {e}")
-        time.sleep(30)  # consulta cada 30 s
+        time.sleep(5)  # consulta baja frecuencia; el candado evita repeticiones
 
 # -----------------------------------------------------------------------------
 # Lanzar threads
@@ -448,7 +453,6 @@ def auto_reminder_poller():
 
 threading.Thread(target=mcp_worker, daemon=True).start()
 threading.Thread(target=auto_reminder_poller, daemon=True).start()
-# (opcional) solo informativo:
 threading.Thread(target=fetch_medications, daemon=True).start()
 
 print("Listening for wake word...")
@@ -494,7 +498,7 @@ try:
                 state = IDLE
 
         elif state == WAITING_FOR_CONFIRMATION:
-            # Espera una respuesta corta del usuario (sí/no) y clasifica
+            # Espera UNA respuesta corta del usuario (sí/no) y clasifica
             print("[CONFIRM] Esperando confirmación de toma (sí/no)…")
             frames, dur = wait_for_speech_then_record_vad(timeout_s=12)
             if frames:
@@ -516,9 +520,12 @@ try:
                 else:
                     speak("No te escuché bien. ¿La tomaste? Responde sí o no.")
 
+                # Salir a IDLE y activar candado para que no repita dentro de la ventana
+                REMINDER_LOCK_UNTIL = time.time() + REMINDER_LOCK_SECS
                 state = IDLE
             else:
-                # No habló: salir de confirmación para no bloquear
+                # No habló: salir de confirmación para no bloquear, con candado corto
+                REMINDER_LOCK_UNTIL = time.time() + REMINDER_LOCK_SECS
                 print("[CONFIRM] no se detectó respuesta; vuelvo a IDLE")
                 state = IDLE
 
