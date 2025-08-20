@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -- coding: utf-8 --
-
 import os
 import io
 import time
@@ -27,21 +24,22 @@ import statistics
 
 ACCESS_KEY = "heQRVcJzahp/QdflX+KJRkOr6yvkclzaAKK6fY1NEKdYwtowZocbOg=="
 
+# Rutas de tu API
 API_BASE_URL       = "https://dreamincode-abgjgwgfckbqergq.eastus-01.azurewebsites.net"
 VOICE_MCP_URL      = f"{API_BASE_URL}/voice_mcp"
-REMINDER_TTS_URL   = f"{API_BASE_URL}/reminder_tts"
-TTS_URL            = f"{API_BASE_URL}/tts"
-MEDS_ALL_URL       = f"{API_BASE_URL}/meds/all"
-STT_URL            = f"{API_BASE_URL}/stt"
-MEDS_DUE_URL       = f"{API_BASE_URL}/meds/due"
+REMINDER_TTS_URL   = f"{API_BASE_URL}/reminder_tts"   # recordatorio (auto/manual)
+TTS_URL            = f"{API_BASE_URL}/tts"            # TTS libre
+MEDS_ALL_URL       = f"{API_BASE_URL}/meds/all"       # listado total (JSON)
+STT_URL            = f"{API_BASE_URL}/stt"            # STT para confirmar sí/no
+MEDS_DUE_URL       = f"{API_BASE_URL}/meds/due"       # cálculo exacto
 
-# === APPOINTMENTS (NUEVO) ===
+# === Citas médicas (añadido) ===
 APPTS_DUE_URL     = f"{API_BASE_URL}/appts/due"
 APPT_TTS_URL      = f"{API_BASE_URL}/appointment_tts"
 
-USER_ID = 3
+USER_ID = 3            # id del adulto mayor
 CHANNELS = 1
-RATE = 16000
+RATE = 16000          # destino para normalización / guardado WAV
 QUEUE = queue.Queue()
 
 # VAD / conversación
@@ -55,17 +53,22 @@ FOLLOWUP_COOLDOWN_S = 0.8
 IDLE = "IDLE"
 WAITING_FOR_SPEECH = "WAITING_FOR_SPEECH"
 CONVERSATION_ACTIVE = "CONVERSATION_ACTIVE"
-WAITING_FOR_CONFIRMATION = "WAITING_FOR_CONFIRMATION"  # medicamentos
-WAITING_FOR_APPT_CONFIRMATION = "WAITING_FOR_APPT_CONFIRMATION"  # citas (NUEVO)
+WAITING_FOR_CONFIRMATION = "WAITING_FOR_CONFIRMATION"              # meds (ya existía)
+WAITING_FOR_APPT_CONFIRMATION = "WAITING_FOR_APPT_CONFIRMATION"    # citas (nuevo)
 state = IDLE
 last_activity_time = time.time()
 last_followup_sent_at = 0.0
 
-# Candados para no repetir
+# Mediciones de tiempo
+last_rec_started_at = 0.0
+
+# Candado para no repetir el mismo reminder durante un rato (meds)
 REMINDER_LOCK_UNTIL = 0.0
 REMINDER_LOCK_SECS  = 120.0
-APPT_LOCK_UNTIL     = 0.0           # (NUEVO)
-APPT_LOCK_SECS      = 180.0         # (NUEVO)
+
+# Candado independiente para citas (nuevo)
+APPT_LOCK_UNTIL = 0.0
+APPT_LOCK_SECS  = 180.0
 
 # -----------------------------------------------------------------------------
 # pydub/ffmpeg
@@ -78,10 +81,10 @@ except Exception:
     pass
 
 # -----------------------------------------------------------------------------
-# Audio local de espera (one-shot)
+# Audio local de espera (una sola vez por petición)
 # -----------------------------------------------------------------------------
 try:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    BASE_DIR = os.path.dirname(os.path.abspath(file))  # (dejado tal cual tenías)
 except NameError:
     BASE_DIR = os.getcwd()
 
@@ -109,8 +112,9 @@ else:
     print(f"[WAIT] Archivo no encontrado: {WAIT_AUDIO_PATH}")
 
 # -----------------------------------------------------------------------------
-# WAV utils
+# Utilidades WAV locales
 # -----------------------------------------------------------------------------
+
 def save_audio_from_frames(filename, frames, sample_rate, sample_width=2, channels=1):
     with wave.open(filename, 'wb') as wf:
         wf.setnchannels(channels)
@@ -119,19 +123,24 @@ def save_audio_from_frames(filename, frames, sample_rate, sample_width=2, channe
         wf.writeframes(b''.join(frames))
 
 # -----------------------------------------------------------------------------
-# Playback robusto
+# Reproducción robusta (sin estática)
 # -----------------------------------------------------------------------------
+
 def _fmt_from_header(ct: str | None) -> str | None:
     if not ct:
         return None
     c = ct.lower()
-    if "wav" in c or "wave" in c: return "wav"
-    if "mpeg" in c or "mp3" in c: return "mp3"
+    if "wav" in c or "wave" in c:
+        return "wav"
+    if "mpeg" in c or "mp3" in c:
+        return "mp3"
     return None
 
 def _sniff_fmt(b: bytes) -> str | None:
-    if len(b) >= 12 and b[:4] == b"RIFF" and b[8:12] == b"WAVE": return "wav"
-    if len(b) >= 2 and (b[:3] == b"ID3" or (b[0] == 0xFF and (b[1] & 0xE0) == 0xE0)): return "mp3"
+    if len(b) >= 12 and b[:4] == b"RIFF" and b[8:12] == b"WAVE":
+        return "wav"
+    if len(b) >= 2 and (b[:3] == b"ID3" or (b[0] == 0xFF and (b[1] & 0xE0) == 0xE0)):
+        return "mp3"
     return None
 
 def _have_mpg123() -> bool:
@@ -148,42 +157,57 @@ def play_response_bytes(resp_bytes: bytes, content_type: str | None):
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 tmp.write(resp_bytes)
                 path = tmp.name
-            try: play_wav(path)
-            finally: os.remove(path)
+            try:
+                play_wav(path)
+            finally:
+                os.remove(path)
 
         elif fmt == "mp3":
             if _have_mpg123():
                 with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-                    tmp.write(resp_bytes); path = tmp.name
-                try: os.system(f"mpg123 -q '{path}' >/dev/null 2>&1")
-                finally: os.remove(path)
+                    tmp.write(resp_bytes)
+                    path = tmp.name
+                try:
+                    os.system(f"mpg123 -q '{path}' >/dev/null 2>&1")
+                finally:
+                    os.remove(path)
             else:
                 audio = AudioSegment.from_file(io.BytesIO(resp_bytes), format="mp3")
                 audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                    audio.export(tmp.name, format="wav", parameters=["-acodec", "pcm_s16le"]); path = tmp.name
-                play_wav(path); os.remove(path)
+                    audio.export(tmp.name, format="wav", parameters=["-acodec", "pcm_s16le"])
+                    path = tmp.name
+                play_wav(path)
+                os.remove(path)
         else:
             audio = AudioSegment.from_file(io.BytesIO(resp_bytes))
             audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                audio.export(tmp.name, format="wav", parameters=["-acodec", "pcm_s16le"]); path = tmp.name
-            play_wav(path); os.remove(path)
+                audio.export(tmp.name, format="wav", parameters=["-acodec", "pcm_s16le"])
+                path = tmp.name
+            play_wav(path)
+            os.remove(path)
 
     except Exception as e:
         print(f"[AUDIO] Playback failed: {e}")
+        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
+            tmp.write(resp_bytes)
+            print(f"[AUDIO] Dumped raw bytes for debug: {tmp.name}")
 
 # -----------------------------------------------------------------------------
-# TZ offset
+# Util: offset local vs UTC en minutos (maneja DST)
 # -----------------------------------------------------------------------------
+
 def get_tz_offset_min() -> int:
     import datetime as _dt
-    now = _dt.datetime.now(); utc = _dt.datetime.utcnow()
+    now = _dt.datetime.now()
+    utc = _dt.datetime.utcnow()
     return int(round((now - utc).total_seconds() / 60.0))
 
 # -----------------------------------------------------------------------------
-# Porcupine + audio in
+# Inicialización de Porcupine + PyAudio y calibración de ruido
 # -----------------------------------------------------------------------------
+
 WAKE_DIR = os.path.join(BASE_DIR, "Wakewords")
 KEYWORD_PATH = os.path.join(WAKE_DIR, "Hey-Dream_en_raspberry-pi_v3_0_0.ppn")
 
@@ -192,20 +216,30 @@ porcupine = pvporcupine.create(
     keyword_paths=[KEYWORD_PATH],
     sensitivities=[0.65]
 )
-SAMPLE_RATE = porcupine.sample_rate
-FRAME_LEN = porcupine.frame_length
+
+SAMPLE_RATE = porcupine.sample_rate        # 16000
+FRAME_LEN = porcupine.frame_length         # típicamente 512
 FRAME_MS = int(1000 * FRAME_LEN / SAMPLE_RATE)
 
 pa = pyaudio.PyAudio()
-stream = pa.open(rate=SAMPLE_RATE, channels=1, format=pyaudio.paInt16, input=True, frames_per_buffer=FRAME_LEN)
+stream = pa.open(
+    rate=SAMPLE_RATE,
+    channels=CHANNELS,
+    format=pyaudio.paInt16,
+    input=True,
+    frames_per_buffer=FRAME_LEN
+)
 
 def _rms_int16(pcm_bytes: bytes) -> float:
-    if not pcm_bytes: return 0.0
-    count = len(pcm_bytes)//2
-    if count == 0: return 0.0
+    if not pcm_bytes:
+        return 0.0
+    count = len(pcm_bytes) // 2
+    if count == 0:
+        return 0.0
     samples = struct.unpack("<" + "h"*count, pcm_bytes[:count*2])
     acc = 0
-    for s in samples: acc += s*s
+    for s in samples:
+        acc += s*s
     return (acc / count) ** 0.5
 
 def calibrate_noise(frames=50) -> float:
@@ -222,23 +256,38 @@ ENERGY_THRESHOLD = calibrate_noise()
 pre_buffer_frames = deque(maxlen=int(SAMPLE_RATE / FRAME_LEN * 1))
 
 # -----------------------------------------------------------------------------
-# VAD helpers
+# Grabación controlada por VAD
 # -----------------------------------------------------------------------------
+
 def record_utterance_vad(prebuffer=None) -> tuple[list[bytes], float]:
-    frames = []; speech_ms = 0; silence_ms = 0; speech_started = False
+    frames = []
+    speech_ms = 0
+    silence_ms = 0
+    speech_started = False
     t0 = time.perf_counter()
-    if prebuffer: frames.extend(list(prebuffer))
+
+    if prebuffer:
+        frames.extend(list(prebuffer))
+
     while True:
         b = stream.read(FRAME_LEN, exception_on_overflow=False)
         frames.append(b)
         rms = _rms_int16(b)
+
         if rms >= ENERGY_THRESHOLD:
-            speech_started = True; speech_ms += FRAME_MS; silence_ms = 0
+            speech_started = True
+            speech_ms += FRAME_MS
+            silence_ms = 0
         else:
-            if speech_started: silence_ms += FRAME_MS
+            if speech_started:
+                silence_ms += FRAME_MS
+
         elapsed = time.perf_counter() - t0
-        if speech_started and speech_ms >= MIN_SPEECH_MS and silence_ms >= TRAILING_SILENCE_MS: break
-        if elapsed >= MAX_UTTERANCE_S: break
+        if speech_started and speech_ms >= MIN_SPEECH_MS and silence_ms >= TRAILING_SILENCE_MS:
+            break
+        if elapsed >= MAX_UTTERANCE_S:
+            break
+
     return frames, (time.perf_counter() - t0)
 
 def wait_for_speech_then_record_vad(timeout_s=FOLLOWUP_LISTEN_WINDOW_S) -> tuple[list[bytes], float]:
@@ -246,13 +295,16 @@ def wait_for_speech_then_record_vad(timeout_s=FOLLOWUP_LISTEN_WINDOW_S) -> tuple
     while (time.perf_counter() - t_start) < timeout_s:
         b = stream.read(FRAME_LEN, exception_on_overflow=False)
         pre_buffer_frames.append(b)
-        if _rms_int16(b) >= ENERGY_THRESHOLD:
-            return record_utterance_vad(prebuffer=pre_buffer_frames)
+        rms = _rms_int16(b)
+        if rms >= ENERGY_THRESHOLD:
+            frames, dur = record_utterance_vad(prebuffer=pre_buffer_frames)
+            return frames, dur
     return [], 0.0
 
 # -----------------------------------------------------------------------------
-# STT + clasificación local
+# STT + clasificación local de confirmación (SÍ/NO)
 # -----------------------------------------------------------------------------
+
 def stt_transcribe_wav(path: str) -> str:
     try:
         with open(path, "rb") as f:
@@ -263,23 +315,62 @@ def stt_transcribe_wav(path: str) -> str:
                 timeout=30
             )
         if r.status_code == 200:
-            return (r.json().get("transcripcion") or "").strip()
+            data = r.json()
+            return (data.get("transcripcion") or "").strip()
+        else:
+            print(f"[STT] HTTP {r.status_code}: {r.text[:160]}")
+            return ""
     except Exception as e:
         print(f"[STT] error: {e}")
-    return ""
+        return ""
 
 def classify_confirmation_local(text: str) -> str:
     t = (text or "").strip().lower()
-    if not t: return "unsure"
-    yes = ["sí","si","ya","claro","por supuesto","listo","hecho","me la tomé","me la tome","ya la tomé","ya la tome","ya lo hice","la tomé","la tome","asistiré","voy a ir","si iré","sí iré"]
-    no  = ["no","todavía no","aún no","aun no","después","luego","más tarde","mas tarde","no la tomé","no la tome","no lo hice","no asistiré","no voy a ir","no puedo ir"]
-    if any(w in t for w in yes): return "yes"
-    if any(w in t for w in no):  return "no"
+    if not t:
+        return "unsure"
+    yes_words = [
+        "sí", "si", "ya", "claro", "por supuesto", "listo", "hecho",
+        "me la tomé", "me la tome", "ya la tomé", "ya la tome",
+        "ya lo hice", "la tomé", "la tome"
+    ]
+    no_words = [
+        "no", "todavía no", "aún no", "aun no", "después", "luego",
+        "más tarde", "mas tarde", "no la tomé", "no la tome",
+        "no lo hice"
+    ]
+    for w in yes_words:
+        if w in t:
+            return "yes"
+    for w in no_words:
+        if w in t:
+            return "no"
+    return "unsure"
+
+# --- NUEVO: clasificador para asistencia a citas (no toca el de meds) ---
+def classify_appt_confirmation_local(text: str) -> str:
+    t = (text or "").strip().lower()
+    if not t:
+        return "unsure"
+    yes_words = [
+        "sí", "si", "asistiré", "voy a ir", "sí iré", "si iré", "confirmo asistencia",
+        "sí voy", "si voy", "voy a asistir"
+    ]
+    no_words = [
+        "no", "no asistiré", "no voy a ir", "no puedo ir", "no voy", "no asistir",
+        "reprogramar", "luego", "más tarde", "mas tarde"
+    ]
+    for w in yes_words:
+        if w in t:
+            return "yes"
+    for w in no_words:
+        if w in t:
+            return "no"
     return "unsure"
 
 # -----------------------------------------------------------------------------
-# Workers
+# Worker: envía audio al backend y reproduce la respuesta
 # -----------------------------------------------------------------------------
+
 def mcp_worker():
     global state, last_activity_time, last_followup_sent_at
     while True:
@@ -296,90 +387,159 @@ def mcp_worker():
                     data={"usuario_id": USER_ID, "lang": "es"},
                     timeout=60
                 )
+                rt = time.time() - t0
+
             if response.status_code == 200:
+                print(f"[NET] round-trip {rt:.2f}s, content-type={response.headers.get('Content-Type')}")
                 play_response_bytes(response.content, response.headers.get("Content-Type"))
+                print("[MCP] Got response audio, played.")
+
                 if expect_followup:
                     state = CONVERSATION_ACTIVE
                     last_activity_time = time.time()
                     last_followup_sent_at = 0.0
                 else:
                     state = IDLE
+            else:
+                print(f"[MCP ERROR] Status: {response.status_code}")
         except Exception as e:
             print(f"[MCP ERROR] {e}")
         finally:
-            try: os.remove(file_to_upload)
-            except Exception: pass
+            try:
+                os.remove(file_to_upload)
+            except Exception:
+                pass
             QUEUE.task_done()
+
+# -----------------------------------------------------------------------------
+# Utilidades extra (opcional)
+# -----------------------------------------------------------------------------
 
 def speak(text: str):
     try:
         r = requests.post(TTS_URL, json={"texto": text}, timeout=30)
         if r.status_code == 200:
             play_response_bytes(r.content, r.headers.get("Content-Type"))
+        else:
+            print(f"[SPEAK] HTTP {r.status_code}: {r.text[:160]}")
     except Exception as e:
         print(f"[SPEAK] error: {e}")
 
-# Poller MEDS (exacto)
+def fetch_medications():
+    try:
+        r = requests.get(MEDS_ALL_URL, params={"usuario_id": USER_ID}, timeout=10)
+        print(f"[MEDS] GET /meds/all -> {r.status_code}")
+        if r.status_code == 200:
+            data = r.json()
+            print(f"[MEDS] count={data.get('count')}")
+        else:
+            print(f"[MEDS] payload: {r.text[:160]}")
+    except Exception as e:
+        print(f"[MEDS] error:", e)
+
+# -----------------------------------------------------------------------------
+# Poller exacto: medicamentos (sin tocar)
+# -----------------------------------------------------------------------------
+
 def auto_reminder_poller():
     global state, REMINDER_LOCK_UNTIL
     while True:
         try:
-            if time.time() < REMINDER_LOCK_UNTIL or state in (WAITING_FOR_CONFIRMATION, WAITING_FOR_APPT_CONFIRMATION):
-                time.sleep(1); continue
+            now = time.time()
+            if now < REMINDER_LOCK_UNTIL or state == WAITING_FOR_CONFIRMATION:
+                time.sleep(1.0)
+                continue
+
             tz = get_tz_offset_min()
-            g = requests.get(MEDS_DUE_URL, params={"usuario_id": USER_ID, "window_min": 0, "tz_offset_min": tz}, timeout=10)
+            g = requests.get(
+                MEDS_DUE_URL,
+                params={"usuario_id": USER_ID, "window_min": 0, "tz_offset_min": tz},
+                timeout=10
+            )
             if g.status_code != 200:
-                time.sleep(5); continue
+                time.sleep(5)
+                continue
+
             items = (g.json() or {}).get("items", [])
             if not items:
-                time.sleep(5); continue
+                time.sleep(5)
+                continue
+
             it = items[0]
             payload = {
-                "usuario_id": USER_ID, "auto": False,
+                "usuario_id": USER_ID,
+                "auto": False,
                 "medicamento": it.get("medicamento") or it.get("NombreMedicamento") or "",
                 "dosis": it.get("dosis") or it.get("Dosis") or "",
                 "hora": it.get("hora") or it.get("HoraToma") or "",
             }
             if not payload["medicamento"] or not payload["hora"]:
-                time.sleep(5); continue
+                time.sleep(5)
+                continue
+
             r = requests.post(REMINDER_TTS_URL, json=payload, timeout=20)
             if r.status_code == 200:
+                print(f"[AUTO] ok tz={tz} ct={r.headers.get('Content-Type')}")
                 play_response_bytes(r.content, r.headers.get("Content-Type"))
                 state = WAITING_FOR_CONFIRMATION
                 REMINDER_LOCK_UNTIL = time.time() + REMINDER_LOCK_SECS
+            else:
+                print(f"[AUTO] HTTP {r.status_code}: {r.text[:160]}")
+
         except Exception as e:
             print(f"[AUTO] error: {e}")
         time.sleep(5)
 
-# Poller APPOINTMENTS (NUEVO)
+# -----------------------------------------------------------------------------
+# Poller exacto: citas médicas (nuevo, espejo del de meds)
+# -----------------------------------------------------------------------------
+
 def appointment_poller():
     global state, APPT_LOCK_UNTIL
     while True:
         try:
-            if time.time() < APPT_LOCK_UNTIL or state in (WAITING_FOR_CONFIRMATION, WAITING_FOR_APPT_CONFIRMATION):
-                time.sleep(1); continue
+            now = time.time()
+            if now < APPT_LOCK_UNTIL or state == WAITING_FOR_APPT_CONFIRMATION:
+                time.sleep(1.0)
+                continue
+
             tz = get_tz_offset_min()
-            g = requests.get(APPTS_DUE_URL, params={"usuario_id": USER_ID, "window_min": 0, "tz_offset_min": tz}, timeout=10)
+            g = requests.get(
+                APPTS_DUE_URL,
+                params={"usuario_id": USER_ID, "window_min": 0, "tz_offset_min": tz},
+                timeout=10
+            )
             if g.status_code != 200:
-                time.sleep(5); continue
+                time.sleep(5)
+                continue
+
             items = (g.json() or {}).get("items", [])
             if not items:
-                time.sleep(5); continue
+                time.sleep(5)
+                continue
+
             it = items[0]
             payload = {
-                "usuario_id": USER_ID, "auto": False,
-                "titulo": it.get("titulo") or "",
-                "hora":   it.get("hora") or "",
-                "lugar":  it.get("lugar") or "",
-                "doctor": it.get("doctor") or "",
+                "usuario_id": USER_ID,
+                "auto": False,
+                "titulo": it.get("titulo") or it.get("Titulo") or "",
+                "hora":   it.get("hora") or it.get("Hora") or "",
+                "lugar":  it.get("lugar") or it.get("Lugar") or "",
+                "doctor": it.get("doctor") or it.get("Doctor") or "",
             }
             if not payload["titulo"] or not payload["hora"]:
-                time.sleep(5); continue
+                time.sleep(5)
+                continue
+
             r = requests.post(APPT_TTS_URL, json=payload, timeout=20)
             if r.status_code == 200:
+                print(f"[APPT] ok tz={tz} ct={r.headers.get('Content-Type')}")
                 play_response_bytes(r.content, r.headers.get("Content-Type"))
                 state = WAITING_FOR_APPT_CONFIRMATION
                 APPT_LOCK_UNTIL = time.time() + APPT_LOCK_SECS
+            else:
+                print(f"[APPT] HTTP {r.status_code}: {r.text[:160]}")
+
         except Exception as e:
             print(f"[APPT] error: {e}")
         time.sleep(5)
@@ -387,15 +547,18 @@ def appointment_poller():
 # -----------------------------------------------------------------------------
 # Lanzar threads
 # -----------------------------------------------------------------------------
+
 threading.Thread(target=mcp_worker, daemon=True).start()
 threading.Thread(target=auto_reminder_poller, daemon=True).start()
-threading.Thread(target=appointment_poller, daemon=True).start()
+threading.Thread(target=appointment_poller, daemon=True).start()   # << nuevo
+threading.Thread(target=fetch_medications, daemon=True).start()
 
 print("Listening for wake word...")
 
 # -----------------------------------------------------------------------------
 # Bucle principal
 # -----------------------------------------------------------------------------
+
 try:
     while True:
         try:
@@ -408,18 +571,24 @@ try:
         pcm_unpacked = struct.unpack_from("h" * (len(pcm)//2), pcm)
 
         if state == IDLE:
-            if porcupine.process(pcm_unpacked) >= 0:
+            keyword_index = porcupine.process(pcm_unpacked)
+            if keyword_index >= 0:
                 print("[DETECTED] Wake word")
                 frames, dur = record_utterance_vad(prebuffer=pre_buffer_frames)
+                print(f"[REC] wake dur={dur:.2f}s frames={len(frames)}")
                 save_audio_from_frames("wake_audio.wav", frames, SAMPLE_RATE)
+                print("[REC] archivo= wake_audio.wav; subiendo…")
                 QUEUE.put(("wake_audio.wav", True))
 
         elif state == CONVERSATION_ACTIVE:
             if last_followup_sent_at and (time.time() - last_followup_sent_at) < FOLLOWUP_COOLDOWN_S:
                 continue
+
             frames, dur = wait_for_speech_then_record_vad(timeout_s=FOLLOWUP_LISTEN_WINDOW_S)
             if frames:
+                print(f"[REC] follow-up dur={dur:.2f}s frames={len(frames)}")
                 save_audio_from_frames("followup.wav", frames, SAMPLE_RATE)
+                print("[REC] archivo= followup.wav; subiendo…")
                 QUEUE.put(("followup.wav", True))
                 last_activity_time = time.time()
                 last_followup_sent_at = time.time()
@@ -427,11 +596,19 @@ try:
                 state = IDLE
 
         elif state == WAITING_FOR_CONFIRMATION:
+            print("[CONFIRM] Esperando confirmación de toma (sí/no)…")
             frames, dur = wait_for_speech_then_record_vad(timeout_s=12)
             if frames:
+                print(f"[CONFIRM] captura dur={dur:.2f}s frames={len(frames)}")
                 tmpf = "confirm.wav"
                 save_audio_from_frames(tmpf, frames, SAMPLE_RATE)
-                text = stt_transcribe_wav(tmpf); os.remove(tmpf)
+                text = stt_transcribe_wav(tmpf)
+                print(f"[CONFIRM] transcript='{text}'")
+                try:
+                    os.remove(tmpf)
+                except Exception:
+                    pass
+
                 intent = classify_confirmation_local(text)
                 if intent == "yes":
                     speak("Perfecto. He registrado que tomaste tu medicamento. ¡Bien hecho!")
@@ -439,37 +616,54 @@ try:
                     speak("De acuerdo. Te recordaré más tarde. Por favor, no lo olvides.")
                 else:
                     speak("No te escuché bien. ¿La tomaste? Responde sí o no.")
+
                 REMINDER_LOCK_UNTIL = time.time() + REMINDER_LOCK_SECS
                 state = IDLE
             else:
                 REMINDER_LOCK_UNTIL = time.time() + REMINDER_LOCK_SECS
+                print("[CONFIRM] no se detectó respuesta; vuelvo a IDLE")
                 state = IDLE
 
+        # --- NUEVO: confirmación de cita ---
         elif state == WAITING_FOR_APPT_CONFIRMATION:
+            print("[APPT] Esperando confirmación de asistencia (sí/no)…")
             frames, dur = wait_for_speech_then_record_vad(timeout_s=12)
             if frames:
+                print(f"[APPT] captura dur={dur:.2f}s frames={len(frames)}")
                 tmpf = "appt_confirm.wav"
                 save_audio_from_frames(tmpf, frames, SAMPLE_RATE)
-                text = stt_transcribe_wav(tmpf); os.remove(tmpf)
-                intent = classify_confirmation_local(text)
+                text = stt_transcribe_wav(tmpf)
+                print(f"[APPT] transcript='{text}'")
+                try:
+                    os.remove(tmpf)
+                except Exception:
+                    pass
+
+                intent = classify_appt_confirmation_local(text)
                 if intent == "yes":
                     speak("Estupendo. He registrado que asistirás a tu cita.")
                 elif intent == "no":
-                    speak("Entendido. Avisaré más tarde para reprogramar si es necesario.")
+                    speak("Entendido. Te recordaré más tarde por si deseas reprogramar.")
                 else:
                     speak("No te escuché bien. ¿Vas a asistir? Responde sí o no.")
+
                 APPT_LOCK_UNTIL = time.time() + APPT_LOCK_SECS
                 state = IDLE
             else:
                 APPT_LOCK_UNTIL = time.time() + APPT_LOCK_SECS
+                print("[APPT] no se detectó respuesta; vuelvo a IDLE")
                 state = IDLE
 
 except KeyboardInterrupt:
     print("\nShutting down...")
 finally:
     try:
-        stream.stop_stream(); stream.close()
-    except Exception: pass
+        stream.stop_stream()
+        stream.close()
+    except Exception:
+        pass
     pa.terminate()
-    try: porcupine.delete()
-    except Exception: pass
+    try:
+        porcupine.delete()
+    except Exception:
+        pass
