@@ -31,6 +31,7 @@ REMINDER_TTS_URL   = f"{API_BASE_URL}/reminder_tts"   # recordatorio (auto/manua
 TTS_URL            = f"{API_BASE_URL}/tts"            # TTS libre
 MEDS_ALL_URL       = f"{API_BASE_URL}/meds/all"       # listado total (JSON)
 STT_URL            = f"{API_BASE_URL}/stt"            # STT para confirmar sí/no
+MEDS_DUE_URL       = f"{API_BASE_URL}/meds/due"       # << NUEVO: cálculo exacto
 
 USER_ID = 3            # id del adulto mayor
 CHANNELS = 1
@@ -38,11 +39,11 @@ RATE = 16000          # destino para normalización / guardado WAV
 QUEUE = queue.Queue()
 
 # VAD / conversación
-MIN_SPEECH_MS = 500            # mínimo de voz acumulada para considerar "frase" válida
-TRAILING_SILENCE_MS = 700      # silencio para cortar al final
-MAX_UTTERANCE_S = 8            # tope duro por utterance
-FOLLOWUP_LISTEN_WINDOW_S = 10  # ventana para esperar que el usuario empiece a hablar
-FOLLOWUP_COOLDOWN_S = 0.8      # anti rebote tras enviar un followup
+MIN_SPEECH_MS = 500
+TRAILING_SILENCE_MS = 700
+MAX_UTTERANCE_S = 8
+FOLLOWUP_LISTEN_WINDOW_S = 10
+FOLLOWUP_COOLDOWN_S = 0.8
 
 # Estados
 IDLE = "IDLE"
@@ -106,7 +107,6 @@ else:
 # -----------------------------------------------------------------------------
 
 def save_audio_from_frames(filename, frames, sample_rate, sample_width=2, channels=1):
-    """Guarda frames PCM (bytes) como WAV."""
     with wave.open(filename, 'wb') as wf:
         wf.setnchannels(channels)
         wf.setsampwidth(sample_width)
@@ -114,7 +114,7 @@ def save_audio_from_frames(filename, frames, sample_rate, sample_width=2, channe
         wf.writeframes(b''.join(frames))
 
 # -----------------------------------------------------------------------------
-# Reproducción robusta de respuestas del backend (sin estática)
+# Reproducción robusta (sin estática)
 # -----------------------------------------------------------------------------
 
 def _fmt_from_header(ct: str | None) -> str | None:
@@ -239,13 +239,11 @@ def calibrate_noise(frames=50) -> float:
         b = stream.read(FRAME_LEN, exception_on_overflow=False)
         vals.append(_rms_int16(b))
     med = statistics.median(vals)
-    thr = max(300.0, med * 3.0)  # suelo 300 y 3x del piso
+    thr = max(300.0, med * 3.0)
     print(f"[VAD] noise median={med:.1f} -> threshold={thr:.1f}")
     return thr
 
 ENERGY_THRESHOLD = calibrate_noise()
-
-# pre-buffer ~1s para la frase tras el wake-word
 pre_buffer_frames = deque(maxlen=int(SAMPLE_RATE / FRAME_LEN * 1))
 
 # -----------------------------------------------------------------------------
@@ -318,9 +316,6 @@ def stt_transcribe_wav(path: str) -> str:
         return ""
 
 def classify_confirmation_local(text: str) -> str:
-    """
-    Devuelve 'yes' | 'no' | 'unsure' con reglas simples en español.
-    """
     t = (text or "").strip().lower()
     if not t:
         return "unsure"
@@ -351,7 +346,6 @@ def mcp_worker():
     while True:
         file_to_upload, expect_followup = QUEUE.get()
         try:
-            # Audio de espera en "one shot" (no loop)
             if WAIT_AUDIO_PLAY_PATH and os.path.exists(WAIT_AUDIO_PLAY_PATH):
                 threading.Thread(target=play_wav, args=(WAIT_AUDIO_PLAY_PATH,), daemon=True).start()
 
@@ -392,7 +386,6 @@ def mcp_worker():
 # -----------------------------------------------------------------------------
 
 def speak(text: str):
-    """TTS libre (no reminder)."""
     try:
         r = requests.post(TTS_URL, json={"texto": text}, timeout=30)
         if r.status_code == 200:
@@ -415,7 +408,7 @@ def fetch_medications():
         print(f"[MEDS] error:", e)
 
 # -----------------------------------------------------------------------------
-# Poller de recordatorios (usa reminder_tts auto + tz_offset_min) con candado
+# Poller exacto: usa /meds/due (window_min=0) y luego /reminder_tts manual
 # -----------------------------------------------------------------------------
 
 def auto_reminder_poller():
@@ -423,29 +416,51 @@ def auto_reminder_poller():
     while True:
         try:
             now = time.time()
-            # Si aún estamos en ventana de supresión, o esperando confirmación, no pidas nada
             if now < REMINDER_LOCK_UNTIL or state == WAITING_FOR_CONFIRMATION:
                 time.sleep(1.0)
                 continue
 
             tz = get_tz_offset_min()
-            payload = {"usuario_id": USER_ID, "auto": True, "tz_offset_min": tz}
+            # 1) Pregunta si hay algo EXACTO ahora (sin ventana)
+            g = requests.get(
+                MEDS_DUE_URL,
+                params={"usuario_id": USER_ID, "window_min": 0, "tz_offset_min": tz},
+                timeout=10
+            )
+            if g.status_code != 200:
+                time.sleep(5)
+                continue
+
+            items = (g.json() or {}).get("items", [])
+            if not items:
+                time.sleep(5)
+                continue
+
+            # 2) Tomamos el primero y pedimos el TTS manual (sin ventana)
+            it = items[0]
+            payload = {
+                "usuario_id": USER_ID,
+                "auto": False,
+                "medicamento": it.get("medicamento") or it.get("NombreMedicamento") or "",
+                "dosis": it.get("dosis") or it.get("Dosis") or "",
+                "hora": it.get("hora") or it.get("HoraToma") or "",
+            }
+            if not payload["medicamento"] or not payload["hora"]:
+                time.sleep(5)
+                continue
+
             r = requests.post(REMINDER_TTS_URL, json=payload, timeout=20)
             if r.status_code == 200:
                 print(f"[AUTO] ok tz={tz} ct={r.headers.get('Content-Type')}")
                 play_response_bytes(r.content, r.headers.get("Content-Type"))
-                # tras sonar el recordatorio, pasar a esperar confirmación
                 state = WAITING_FOR_CONFIRMATION
-                # activar candado para no repetir reminder dentro de la ventana
                 REMINDER_LOCK_UNTIL = time.time() + REMINDER_LOCK_SECS
-            elif r.status_code == 404:
-                # No hay medicamento en este minuto/ventana
-                pass
             else:
                 print(f"[AUTO] HTTP {r.status_code}: {r.text[:160]}")
+
         except Exception as e:
             print(f"[AUTO] error: {e}")
-        time.sleep(5)  # consulta baja frecuencia; el candado evita repeticiones
+        time.sleep(5)
 
 # -----------------------------------------------------------------------------
 # Lanzar threads
@@ -498,7 +513,6 @@ try:
                 state = IDLE
 
         elif state == WAITING_FOR_CONFIRMATION:
-            # Espera UNA respuesta corta del usuario (sí/no) y clasifica
             print("[CONFIRM] Esperando confirmación de toma (sí/no)…")
             frames, dur = wait_for_speech_then_record_vad(timeout_s=12)
             if frames:
@@ -520,11 +534,9 @@ try:
                 else:
                     speak("No te escuché bien. ¿La tomaste? Responde sí o no.")
 
-                # Salir a IDLE y activar candado para que no repita dentro de la ventana
                 REMINDER_LOCK_UNTIL = time.time() + REMINDER_LOCK_SECS
                 state = IDLE
             else:
-                # No habló: salir de confirmación para no bloquear, con candado corto
                 REMINDER_LOCK_UNTIL = time.time() + REMINDER_LOCK_SECS
                 print("[CONFIRM] no se detectó respuesta; vuelvo a IDLE")
                 state = IDLE
