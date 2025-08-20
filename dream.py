@@ -17,7 +17,6 @@ import requests
 from pydub import AudioSegment
 import tempfile
 import statistics
-import subprocess
 
 # -----------------------------------------------------------------------------
 # Configuración
@@ -25,32 +24,24 @@ import subprocess
 
 ACCESS_KEY = "heQRVcJzahp/QdflX+KJRkOr6yvkclzaAKK6fY1NEKdYwtowZocbOg=="
 
-BASE_URL         = "https://dreamincode-abgjgwgfckbqergq.eastus-01.azurewebsites.net"
-VOICE_MCP_URL    = f"{BASE_URL}/voice_mcp"
-REMINDER_TTS_URL = f"{BASE_URL}/reminder_tts"
-MEDS_ALL_URL     = f"{BASE_URL}/meds/all"
-TTS_URL          = f"{BASE_URL}/tts"
+# Rutas de tu API
+API_BASE_URL       = "https://dreamincode-abgjgwgfckbqergq.eastus-01.azurewebsites.net"
+VOICE_MCP_URL      = f"{API_BASE_URL}/voice_mcp"
+REMINDER_TTS_URL   = f"{API_BASE_URL}/reminder_tts"   # recordatorio (auto/manual)
+TTS_URL            = f"{API_BASE_URL}/tts"            # TTS libre
+MEDS_ALL_URL       = f"{API_BASE_URL}/meds/all"       # listado total (JSON)
 
-USER_ID = 3
+USER_ID = 3            # id del adulto mayor
 CHANNELS = 1
-RATE = 16000
+RATE = 16000          # destino para normalización / guardado WAV
 QUEUE = queue.Queue()
 
-# Dispositivos ALSA / PyAudio (AJUSTA ESTOS DOS SI HACE FALTA)
-ALSA_PLAYBACK_DEVICE = "pulse"  # ← antes tenías 'plughw:0,0'
-ALSA_CAPTURE_INDEX   = 0        # ← fija el micrófono en 'pulse'
-
 # VAD / conversación
-MIN_SPEECH_MS = 500
-TRAILING_SILENCE_MS = 700
-MAX_UTTERANCE_S = 8
-FOLLOWUP_LISTEN_WINDOW_S = 10
-FOLLOWUP_COOLDOWN_S = 0.8
-
-# Scheduler
-CHECK_INTERVAL_S = 60
-MATCH_TOLERANCE_MIN = 1
-TEST_REMINDER_ON_START = False
+MIN_SPEECH_MS = 500            # mínimo de voz acumulada para considerar "frase" válida
+TRAILING_SILENCE_MS = 700      # silencio para cortar al final
+MAX_UTTERANCE_S = 8            # tope duro por utterance
+FOLLOWUP_LISTEN_WINDOW_S = 10  # ventana para esperar que el usuario empiece a hablar
+FOLLOWUP_COOLDOWN_S = 0.8      # anti rebote tras enviar un followup
 
 # Estados
 IDLE = "IDLE"
@@ -60,6 +51,9 @@ WAITING_FOR_CONFIRMATION = "WAITING_FOR_CONFIRMATION"
 state = IDLE
 last_activity_time = time.time()
 last_followup_sent_at = 0.0
+
+# Mediciones de tiempo
+last_rec_started_at = 0.0
 
 # -----------------------------------------------------------------------------
 # pydub/ffmpeg
@@ -75,25 +69,14 @@ except Exception:
 # Audio local de espera (una sola vez por petición)
 # -----------------------------------------------------------------------------
 try:
-    BASE_DIR = os.path.dirname(os.path.abspath(_file_))
+    BASE_DIR = os.path.dirname(os.path.abspath(file))
 except NameError:
     BASE_DIR = os.getcwd()
 
 WAIT_AUDIO_PATH = os.path.join(BASE_DIR, "PrefabAudios", "waitResponse.wav")
 
-def _play_cmd(cmd: list[str]):
-    """Ejecuta un comando de reproducción sin volcar basura a la consola."""
-    try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-    except Exception as e:
-        print(f"[PLAY] error: {e}")
-
 def play_wav(path: str):
-    cmd = ["aplay", "-q"]
-    if ALSA_PLAYBACK_DEVICE:
-        cmd += ["-D", ALSA_PLAYBACK_DEVICE]
-    cmd += [path]
-    _play_cmd(cmd)
+    os.system(f"aplay -q '{path}' >/dev/null 2>&1")
 
 def _normalize_wait_wav(src_path: str) -> str:
     audio = AudioSegment.from_file(src_path)
@@ -118,6 +101,7 @@ else:
 # -----------------------------------------------------------------------------
 
 def save_audio_from_frames(filename, frames, sample_rate, sample_width=2, channels=1):
+    """Guarda frames PCM (bytes) como WAV."""
     with wave.open(filename, 'wb') as wf:
         wf.setnchannels(channels)
         wf.setsampwidth(sample_width)
@@ -125,7 +109,7 @@ def save_audio_from_frames(filename, frames, sample_rate, sample_width=2, channe
         wf.writeframes(b''.join(frames))
 
 # -----------------------------------------------------------------------------
-# Reproducción robusta (WAV/MP3)
+# Reproducción robusta de respuestas del backend (sin estática)
 # -----------------------------------------------------------------------------
 
 def _fmt_from_header(ct: str | None) -> str | None:
@@ -170,11 +154,7 @@ def play_response_bytes(resp_bytes: bytes, content_type: str | None):
                     tmp.write(resp_bytes)
                     path = tmp.name
                 try:
-                    cmd = ["mpg123", "-q"]
-                    if ALSA_PLAYBACK_DEVICE:
-                        cmd += ["-a", ALSA_PLAYBACK_DEVICE]
-                    cmd += [path]
-                    _play_cmd(cmd)
+                    os.system(f"mpg123 -q '{path}' >/dev/null 2>&1")
                 finally:
                     os.remove(path)
             else:
@@ -185,7 +165,6 @@ def play_response_bytes(resp_bytes: bytes, content_type: str | None):
                     path = tmp.name
                 play_wav(path)
                 os.remove(path)
-
         else:
             audio = AudioSegment.from_file(io.BytesIO(resp_bytes))
             audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
@@ -202,56 +181,41 @@ def play_response_bytes(resp_bytes: bytes, content_type: str | None):
             print(f"[AUDIO] Dumped raw bytes for debug: {tmp.name}")
 
 # -----------------------------------------------------------------------------
+# Util: offset local vs UTC en minutos (maneja DST)
+# -----------------------------------------------------------------------------
+
+def get_tz_offset_min() -> int:
+    import datetime as _dt
+    now = _dt.datetime.now()
+    utc = _dt.datetime.utcnow()
+    return int(round((now - utc).total_seconds() / 60.0))
+
+# -----------------------------------------------------------------------------
 # Inicialización de Porcupine + PyAudio y calibración de ruido
 # -----------------------------------------------------------------------------
 
-def _list_input_devices(pa_obj):
-    info = pa_obj.get_host_api_info_by_index(0)
-    ndev = info.get('deviceCount', 0)
-    print("[AUDIO] Dispositivos de entrada detectados:")
-    for i in range(ndev):
-        di = pa_obj.get_device_info_by_host_api_device_index(0, i)
-        if di.get('maxInputChannels', 0) > 0:
-            print(f"  - index={i} name='{di.get('name')}' ch={di.get('maxInputChannels')}")
-
-def _open_input_stream(pa_obj, rate, channels, frames_per_buffer, index=None):
-    try:
-        kwargs = dict(
-            rate=rate,
-            channels=channels,
-            format=pyaudio.paInt16,
-            input=True,
-            frames_per_buffer=frames_per_buffer
-        )
-        if index is not None:
-            kwargs["input_device_index"] = index
-        return pa_obj.open(**kwargs)
-    except Exception as e:
-        print(f"[AUDIO] No se pudo abrir input_device_index={index}: {e}")
-        return None
-
-# Wakeword
 WAKE_DIR = os.path.join(BASE_DIR, "Wakewords")
+# Usa tu archivo .ppn personalizado si corresponde:
 KEYWORD_PATH = os.path.join(WAKE_DIR, "Hey-Dream_en_raspberry-pi_v3_0_0.ppn")
 
 porcupine = pvporcupine.create(
     access_key=ACCESS_KEY,
     keyword_paths=[KEYWORD_PATH],
-    sensitivities=[0.65]
+    sensitivities=[0.65]   # 0–1 (más alto = más sensible = más falsos positivos)
 )
-SAMPLE_RATE = porcupine.sample_rate
-FRAME_LEN = porcupine.frame_length
+
+SAMPLE_RATE = porcupine.sample_rate        # 16000
+FRAME_LEN = porcupine.frame_length         # típicamente 512
 FRAME_MS = int(1000 * FRAME_LEN / SAMPLE_RATE)
 
 pa = pyaudio.PyAudio()
-_list_input_devices(pa)
-
-stream = _open_input_stream(pa, SAMPLE_RATE, CHANNELS, FRAME_LEN, index=ALSA_CAPTURE_INDEX)
-if stream is None:
-    # intento sin índice (auto)
-    stream = _open_input_stream(pa, SAMPLE_RATE, CHANNELS, FRAME_LEN, index=None)
-    if stream is None:
-        raise RuntimeError("No fue posible abrir ningún dispositivo de captura. Ajusta ALSA_CAPTURE_INDEX.")
+stream = pa.open(
+    rate=SAMPLE_RATE,
+    channels=CHANNELS,
+    format=pyaudio.paInt16,
+    input=True,
+    frames_per_buffer=FRAME_LEN
+)
 
 def _rms_int16(pcm_bytes: bytes) -> float:
     if not pcm_bytes:
@@ -271,11 +235,13 @@ def calibrate_noise(frames=50) -> float:
         b = stream.read(FRAME_LEN, exception_on_overflow=False)
         vals.append(_rms_int16(b))
     med = statistics.median(vals)
-    thr = max(300.0, med * 3.0)
+    thr = max(300.0, med * 3.0)  # suelo 300 y 3x del piso
     print(f"[VAD] noise median={med:.1f} -> threshold={thr:.1f}")
     return thr
 
 ENERGY_THRESHOLD = calibrate_noise()
+
+# pre-buffer ~1s para la frase tras el wake-word
 pre_buffer_frames = deque(maxlen=int(SAMPLE_RATE / FRAME_LEN * 1))
 
 # -----------------------------------------------------------------------------
@@ -333,7 +299,7 @@ def mcp_worker():
     while True:
         file_to_upload, expect_followup = QUEUE.get()
         try:
-            # SINGLE SHOT de audio de “espere…”
+            # Audio de espera en "one shot" (no loop)
             if WAIT_AUDIO_PLAY_PATH and os.path.exists(WAIT_AUDIO_PLAY_PATH):
                 threading.Thread(target=play_wav, args=(WAIT_AUDIO_PLAY_PATH,), daemon=True).start()
 
@@ -359,7 +325,7 @@ def mcp_worker():
                 else:
                     state = IDLE
             else:
-                print(f"[MCP ERROR] Status: {response.status_code} body={response.text[:200]}")
+                print(f"[MCP ERROR] Status: {response.status_code}")
         except Exception as e:
             print(f"[MCP ERROR] {e}")
         finally:
@@ -370,150 +336,71 @@ def mcp_worker():
             QUEUE.task_done()
 
 # -----------------------------------------------------------------------------
-# Scheduler de recordatorios (usa /meds/all + /reminder_tts)
+# Utilidades extra (opcional)
 # -----------------------------------------------------------------------------
 
-FIRED_REMINDERS = set()
-MEDICATIONS: list[dict] = []
-
-def fetch_medications():
-    global MEDICATIONS
+def speak(text: str):
+    """TTS libre (no reminder)."""
     try:
-        r = requests.get(MEDS_ALL_URL, params={"usuario_id": USER_ID}, timeout=10)
+        r = requests.post(TTS_URL, json={"texto": text}, timeout=30)
         if r.status_code == 200:
-            payload = r.json()
-            meds = payload.get("items", []) or payload.get("medications", [])
-            if isinstance(meds, list):
-                MEDICATIONS = meds
-                print(f"[MEDS] Updated medications: {len(MEDICATIONS)} items")
-            else:
-                print(f"[MEDS] Unexpected payload: {payload.keys()}")
-        else:
-            print(f"[MEDS] Failed to fetch: {r.status_code} body={r.text[:200]}")
-    except Exception as e:
-        print(f"[MEDS] Error fetching medications: {e}")
-
-def medication_refresher():
-    while True:
-        fetch_medications()
-        time.sleep(600)
-
-def _hhmm_to_minutes(s: str) -> int:
-    h, m = s.split(":")
-    return int(h) * 60 + int(m)
-
-def _today_flag_key() -> str:
-    return {
-        "Monday": "Lunes",
-        "Tuesday": "Martes",
-        "Wednesday": "Miercoles",
-        "Thursday": "Jueves",
-        "Friday": "Viernes",
-        "Saturday": "Sabado",
-        "Sunday": "Domingo",
-    }[datetime.now().strftime("%A")]
-
-def _play_reminder_via_backend(med: dict, now_hhmm: str):
-    nombre = med.get("NombreMedicamento", "tu medicamento")
-    dosis  = med.get("Dosis", "") or ""
-    try:
-        print(f"[AUTO] POST /reminder_tts medicamento='{nombre}' hora='{now_hhmm}'")
-        r = requests.post(
-            REMINDER_TTS_URL,
-            json={
-                "usuario_id": USER_ID,
-                "auto": False,
-                "medicamento": nombre,
-                "dosis": dosis,
-                "hora": now_hhmm
-            },
-            timeout=30
-        )
-        if r.status_code == 200:
-            print(f"[AUTO] ok ct={r.headers.get('Content-Type')}")
             play_response_bytes(r.content, r.headers.get("Content-Type"))
         else:
-            print(f"[AUTO] HTTP {r.status_code} body={r.text[:200]}")
+            print(f"[SPEAK] HTTP {r.status_code}: {r.text[:160]}")
     except Exception as e:
-        print(f"[AUTO] error: {e}")
+        print(f"[SPEAK] error: {e}")
 
-def reminder_scheduler():
+# (opcional) ver inventario de medicamentos desde API
+def fetch_medications():
+    try:
+        r = requests.get(MEDS_ALL_URL, params={"usuario_id": USER_ID}, timeout=10)
+        print(f"[MEDS] GET /meds/all -> {r.status_code}")
+        if r.status_code == 200:
+            data = r.json()
+            print(f"[MEDS] count={data.get('count')}")  # no se usa, sólo info
+        else:
+            print(f"[MEDS] payload: {r.text[:160]}")
+    except Exception as e:
+        print(f"[MEDS] error:", e)
+
+# -----------------------------------------------------------------------------
+# Poller de recordatorios (usa reminder_tts auto + tz_offset_min)
+# -----------------------------------------------------------------------------
+
+def auto_reminder_poller():
     while True:
-        now = datetime.now()
-        now_hhmm = now.strftime("%H:%M")
-        today_key = _today_flag_key()
-        now_min = now.hour * 60 + now.minute
-
-        print(f"[SCHED] tick now={now.isoformat(timespec='seconds')} ({today_key}) — meds={len(MEDICATIONS)}")
-
-        for med in MEDICATIONS:
-            try:
-                mid = med.get("MedicamentoID") or med.get("NombreMedicamento")
-                hora = (med.get("HoraToma") or "").strip()
-                activo = bool(med.get("Activo", True))
-
-                print(f"  [CHK] id={mid} activo={activo} HoraToma='{hora}' "
-                      f"dias={{Lu:{med.get('Lunes')}, Ma:{med.get('Martes')}, Mi:{med.get('Miercoles')}, "
-                      f"Ju:{med.get('Jueves')}, Vi:{med.get('Viernes')}, Sa:{med.get('Sabado')}, Do:{med.get('Domingo')}}}")
-
-                if not activo or not hora or not med.get(today_key, False):
-                    continue
-
-                med_min = _hhmm_to_minutes(hora)
-                diff = abs(med_min - now_min)
-
-                if diff <= MATCH_TOLERANCE_MIN:
-                    key = (now.date().isoformat(), hora, str(mid))
-                    if key in FIRED_REMINDERS:
-                        print(f"  [SKIP] already fired {key}")
-                        continue
-
-                    FIRED_REMINDERS.add(key)
-                    print(f"  [FIRE] {mid} @ {hora} (diff={diff}min) -> /reminder_tts")
-                    _play_reminder_via_backend(med, now_hhmm)
-
-            except Exception as e:
-                print(f"[SCHED] error with med {med}: {e}")
-
-        time.sleep(CHECK_INTERVAL_S)
+        try:
+            tz = get_tz_offset_min()
+            payload = {"usuario_id": USER_ID, "auto": True, "tz_offset_min": tz}
+            r = requests.post(REMINDER_TTS_URL, json=payload, timeout=20)
+            if r.status_code == 200:
+                print(f"[AUTO] ok tz={tz} ct={r.headers.get('Content-Type')}")
+                play_response_bytes(r.content, r.headers.get("Content-Type"))
+            elif r.status_code == 404:
+                # No hay medicamento en este minuto/ventana
+                pass
+            else:
+                print(f"[AUTO] HTTP {r.status_code}: {r.text[:160]}")
+        except Exception as e:
+            print(f"[AUTO] error: {e}")
+        time.sleep(30)  # consulta cada 30 s
 
 # -----------------------------------------------------------------------------
-# Lanzar threads y bucle principal
+# Lanzar threads
 # -----------------------------------------------------------------------------
 
-def mcp_worker_thread():
-    threading.Thread(target=mcp_worker, daemon=True).start()
+threading.Thread(target=mcp_worker, daemon=True).start()
+threading.Thread(target=auto_reminder_poller, daemon=True).start()
+# (opcional) solo informativo:
+threading.Thread(target=fetch_medications, daemon=True).start()
 
-def sched_threads():
-    fetch_medications()
-    threading.Thread(target=medication_refresher, daemon=True).start()
-    threading.Thread(target=reminder_scheduler, daemon=True).start()
+print("Listening for wake word...")
 
-def self_test_reminder():
-    if not TEST_REMINDER_ON_START:
-        return
-    fake_med = {
-        "MedicamentoID": "TEST",
-        "NombreMedicamento": "pastilla de prueba",
-        "Dosis": "1",
-        "Activo": True,
-        "Lunes": True, "Martes": True, "Miercoles": True, "Jueves": True,
-        "Viernes": True, "Sabado": True, "Domingo": True,
-        "HoraToma": datetime.now().strftime("%H:%M"),
-    }
-    print("[TEST] Lanzando recordatorio de prueba…")
-    _play_reminder_via_backend(fake_med, fake_med["HoraToma"])
+# -----------------------------------------------------------------------------
+# Bucle principal
+# -----------------------------------------------------------------------------
 
-def main():
-    global state, last_followup_sent_at
-
-    mcp_worker_thread()
-    sched_threads()
-    self_test_reminder()
-
-    print("[INFO] Playback ALSA device:", ALSA_PLAYBACK_DEVICE)
-    print("Listening for wake word...")
-
+try:
     while True:
         try:
             pcm = stream.read(FRAME_LEN, exception_on_overflow=False)
@@ -525,12 +412,12 @@ def main():
         pcm_unpacked = struct.unpack_from("h" * (len(pcm)//2), pcm)
 
         if state == IDLE:
-            keyword_index = pvporcupine.Porcupine.process(porcupine, pcm_unpacked)
+            keyword_index = porcupine.process(pcm_unpacked)
             if keyword_index >= 0:
                 print("[DETECTED] Wake word")
                 frames, dur = record_utterance_vad(prebuffer=pre_buffer_frames)
                 print(f"[REC] wake dur={dur:.2f}s frames={len(frames)}")
-                save_audio_from_frames("wake_audio.wav", frames, RATE)
+                save_audio_from_frames("wake_audio.wav", frames, SAMPLE_RATE)
                 print("[REC] archivo= wake_audio.wav; subiendo…")
                 QUEUE.put(("wake_audio.wav", True))
 
@@ -541,32 +428,24 @@ def main():
             frames, dur = wait_for_speech_then_record_vad(timeout_s=FOLLOWUP_LISTEN_WINDOW_S)
             if frames:
                 print(f"[REC] follow-up dur={dur:.2f}s frames={len(frames)}")
-                save_audio_from_frames("followup.wav", frames, RATE)
+                save_audio_from_frames("followup.wav", frames, SAMPLE_RATE)
                 print("[REC] archivo= followup.wav; subiendo…")
                 QUEUE.put(("followup.wav", True))
+                last_activity_time = time.time()
                 last_followup_sent_at = time.time()
             else:
                 state = IDLE
 
-if __name__ == "_main_":
+except KeyboardInterrupt:
+    print("\nShutting down...")
+finally:
     try:
-        # Evita que ALSA intente usar JACK
-        os.environ.setdefault("ALSA_CARD", "0")
-        os.environ.setdefault("AUDIODEV", ALSA_PLAYBACK_DEVICE or "default")
-        main()
-    except KeyboardInterrupt:
-        print("\nShutting down...")
-    finally:
-        try:
-            stream.stop_stream()
-            stream.close()
-        except Exception:
-            pass
-        try:
-            pa.terminate()
-        except Exception:
-            pass
-        try:
-            porcupine.delete()
-        except Exception:
-            pass
+        stream.stop_stream()
+        stream.close()
+    except Exception:
+        pass
+    pa.terminate()
+    try:
+        porcupine.delete()
+    except Exception:
+        pass
