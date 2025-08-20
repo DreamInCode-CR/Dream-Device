@@ -8,7 +8,7 @@ Este sistema funciona en una **Raspberry Pi Zero 2** y utiliza **detección de p
 
 ## Características principales  
 
--  **Activación por wake word** usando **Hey Dream** (ejemplo: *"Hey Dream"*).  
+-  **Activación por wake word** usando **Hey Dream**.  
 -  **Grabación automática de frases** con detección de voz y silencios (VAD).  
 -  **Conversación fluida** con detección de seguimientos (follow-ups).  
 -  **Recordatorios de medicamentos automáticos** con confirmación de *sí / no*.  
