@@ -37,8 +37,8 @@ RATE = 16000
 QUEUE = queue.Queue()
 
 # Dispositivos ALSA / PyAudio (AJUSTA ESTOS DOS SI HACE FALTA)
-ALSA_PLAYBACK_DEVICE = "plughw:0,0"   # Ejemplos: "plughw:0,0" / "plughw:1,0" / "default"
-ALSA_CAPTURE_INDEX   = None           # Índice entero del micrófono en PyAudio, o None para auto
+ALSA_PLAYBACK_DEVICE = "pulse"  # ← antes tenías 'plughw:0,0'
+ALSA_CAPTURE_INDEX   = 0        # ← fija el micrófono en 'pulse'
 
 # VAD / conversación
 MIN_SPEECH_MS = 500
