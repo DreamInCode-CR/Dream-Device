@@ -1,4 +1,3 @@
-
 import os
 import io
 import time
@@ -18,6 +17,7 @@ import requests
 from pydub import AudioSegment
 import tempfile
 import statistics
+import subprocess
 
 # -----------------------------------------------------------------------------
 # Configuración
@@ -25,17 +25,20 @@ import statistics
 
 ACCESS_KEY = "heQRVcJzahp/QdflX+KJRkOr6yvkclzaAKK6fY1NEKdYwtowZocbOg=="
 
-# --- ENDPOINTS base y rutas específicas ---
 BASE_URL         = "https://dreamincode-abgjgwgfckbqergq.eastus-01.azurewebsites.net"
 VOICE_MCP_URL    = f"{BASE_URL}/voice_mcp"
 REMINDER_TTS_URL = f"{BASE_URL}/reminder_tts"
-MEDS_ALL_URL     = f"{BASE_URL}/meds/all"   # <- devuelve {"items":[...]}
+MEDS_ALL_URL     = f"{BASE_URL}/meds/all"
 TTS_URL          = f"{BASE_URL}/tts"
 
-USER_ID = 3            # id del adulto mayor
+USER_ID = 3
 CHANNELS = 1
-RATE = 16000          # destino para normalización / guardado WAV
+RATE = 16000
 QUEUE = queue.Queue()
+
+# Dispositivos ALSA / PyAudio (AJUSTA ESTOS DOS SI HACE FALTA)
+ALSA_PLAYBACK_DEVICE = "plughw:0,0"   # Ejemplos: "plughw:0,0" / "plughw:1,0" / "default"
+ALSA_CAPTURE_INDEX   = None           # Índice entero del micrófono en PyAudio, o None para auto
 
 # VAD / conversación
 MIN_SPEECH_MS = 500
@@ -45,9 +48,9 @@ FOLLOWUP_LISTEN_WINDOW_S = 10
 FOLLOWUP_COOLDOWN_S = 0.8
 
 # Scheduler
-CHECK_INTERVAL_S = 60           # revisión cada minuto
-MATCH_TOLERANCE_MIN = 1         # tolerancia ±1 minuto para disparar
-TEST_REMINDER_ON_START = False  # pon True para probar un recordatorio al arrancar
+CHECK_INTERVAL_S = 60
+MATCH_TOLERANCE_MIN = 1
+TEST_REMINDER_ON_START = False
 
 # Estados
 IDLE = "IDLE"
@@ -78,8 +81,19 @@ except NameError:
 
 WAIT_AUDIO_PATH = os.path.join(BASE_DIR, "PrefabAudios", "waitResponse.wav")
 
+def _play_cmd(cmd: list[str]):
+    """Ejecuta un comando de reproducción sin volcar basura a la consola."""
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    except Exception as e:
+        print(f"[PLAY] error: {e}")
+
 def play_wav(path: str):
-    os.system(f"aplay -q '{path}' >/dev/null 2>&1")
+    cmd = ["aplay", "-q"]
+    if ALSA_PLAYBACK_DEVICE:
+        cmd += ["-D", ALSA_PLAYBACK_DEVICE]
+    cmd += [path]
+    _play_cmd(cmd)
 
 def _normalize_wait_wav(src_path: str) -> str:
     audio = AudioSegment.from_file(src_path)
@@ -111,7 +125,7 @@ def save_audio_from_frames(filename, frames, sample_rate, sample_width=2, channe
         wf.writeframes(b''.join(frames))
 
 # -----------------------------------------------------------------------------
-# Reproducción robusta de respuestas del backend (sin estática)
+# Reproducción robusta (WAV/MP3)
 # -----------------------------------------------------------------------------
 
 def _fmt_from_header(ct: str | None) -> str | None:
@@ -132,8 +146,7 @@ def _sniff_fmt(b: bytes) -> str | None:
     return None
 
 def _have_mpg123() -> bool:
-    import shutil as _sh
-    return _sh.which("mpg123") is not None
+    return shutil.which("mpg123") is not None
 
 def play_response_bytes(resp_bytes: bytes, content_type: str | None):
     sniff_fmt = _sniff_fmt(resp_bytes)
@@ -157,7 +170,11 @@ def play_response_bytes(resp_bytes: bytes, content_type: str | None):
                     tmp.write(resp_bytes)
                     path = tmp.name
                 try:
-                    os.system(f"mpg123 -q '{path}' >/dev/null 2>&1")
+                    cmd = ["mpg123", "-q"]
+                    if ALSA_PLAYBACK_DEVICE:
+                        cmd += ["-a", ALSA_PLAYBACK_DEVICE]
+                    cmd += [path]
+                    _play_cmd(cmd)
                 finally:
                     os.remove(path)
             else:
@@ -188,8 +205,34 @@ def play_response_bytes(resp_bytes: bytes, content_type: str | None):
 # Inicialización de Porcupine + PyAudio y calibración de ruido
 # -----------------------------------------------------------------------------
 
+def _list_input_devices(pa_obj):
+    info = pa_obj.get_host_api_info_by_index(0)
+    ndev = info.get('deviceCount', 0)
+    print("[AUDIO] Dispositivos de entrada detectados:")
+    for i in range(ndev):
+        di = pa_obj.get_device_info_by_host_api_device_index(0, i)
+        if di.get('maxInputChannels', 0) > 0:
+            print(f"  - index={i} name='{di.get('name')}' ch={di.get('maxInputChannels')}")
+
+def _open_input_stream(pa_obj, rate, channels, frames_per_buffer, index=None):
+    try:
+        kwargs = dict(
+            rate=rate,
+            channels=channels,
+            format=pyaudio.paInt16,
+            input=True,
+            frames_per_buffer=frames_per_buffer
+        )
+        if index is not None:
+            kwargs["input_device_index"] = index
+        return pa_obj.open(**kwargs)
+    except Exception as e:
+        print(f"[AUDIO] No se pudo abrir input_device_index={index}: {e}")
+        return None
+
+# Wakeword
 WAKE_DIR = os.path.join(BASE_DIR, "Wakewords")
-KEYWORD_PATH = os.path.join(WAKE_DIR, "Hey-Dream_en_raspberry-pi_v3_0_0.ppn")  # tu .ppn
+KEYWORD_PATH = os.path.join(WAKE_DIR, "Hey-Dream_en_raspberry-pi_v3_0_0.ppn")
 
 porcupine = pvporcupine.create(
     access_key=ACCESS_KEY,
@@ -201,13 +244,14 @@ FRAME_LEN = porcupine.frame_length
 FRAME_MS = int(1000 * FRAME_LEN / SAMPLE_RATE)
 
 pa = pyaudio.PyAudio()
-stream = pa.open(
-    rate=SAMPLE_RATE,
-    channels=CHANNELS,
-    format=pyaudio.paInt16,
-    input=True,
-    frames_per_buffer=FRAME_LEN
-)
+_list_input_devices(pa)
+
+stream = _open_input_stream(pa, SAMPLE_RATE, CHANNELS, FRAME_LEN, index=ALSA_CAPTURE_INDEX)
+if stream is None:
+    # intento sin índice (auto)
+    stream = _open_input_stream(pa, SAMPLE_RATE, CHANNELS, FRAME_LEN, index=None)
+    if stream is None:
+        raise RuntimeError("No fue posible abrir ningún dispositivo de captura. Ajusta ALSA_CAPTURE_INDEX.")
 
 def _rms_int16(pcm_bytes: bytes) -> float:
     if not pcm_bytes:
@@ -232,7 +276,6 @@ def calibrate_noise(frames=50) -> float:
     return thr
 
 ENERGY_THRESHOLD = calibrate_noise()
-
 pre_buffer_frames = deque(maxlen=int(SAMPLE_RATE / FRAME_LEN * 1))
 
 # -----------------------------------------------------------------------------
@@ -334,7 +377,6 @@ FIRED_REMINDERS = set()
 MEDICATIONS: list[dict] = []
 
 def fetch_medications():
-    """Carga todas las meds del usuario desde /meds/all."""
     global MEDICATIONS
     try:
         r = requests.get(MEDS_ALL_URL, params={"usuario_id": USER_ID}, timeout=10)
@@ -361,7 +403,6 @@ def _hhmm_to_minutes(s: str) -> int:
     return int(h) * 60 + int(m)
 
 def _today_flag_key() -> str:
-    # Devuelve 'Lunes'...'Domingo'
     return {
         "Monday": "Lunes",
         "Tuesday": "Martes",
@@ -373,7 +414,6 @@ def _today_flag_key() -> str:
     }[datetime.now().strftime("%A")]
 
 def _play_reminder_via_backend(med: dict, now_hhmm: str):
-    """Llama a /reminder_tts con los datos completos (tu flujo de servidor)."""
     nombre = med.get("NombreMedicamento", "tu medicamento")
     dosis  = med.get("Dosis", "") or ""
     try:
@@ -398,7 +438,6 @@ def _play_reminder_via_backend(med: dict, now_hhmm: str):
         print(f"[AUTO] error: {e}")
 
 def reminder_scheduler():
-    """Evalúa cada minuto y dispara recordatorios que coincidan."""
     while True:
         now = datetime.now()
         now_hhmm = now.strftime("%H:%M")
@@ -413,7 +452,6 @@ def reminder_scheduler():
                 hora = (med.get("HoraToma") or "").strip()
                 activo = bool(med.get("Activo", True))
 
-                # Logs de evaluación
                 print(f"  [CHK] id={mid} activo={activo} HoraToma='{hora}' "
                       f"dias={{Lu:{med.get('Lunes')}, Ma:{med.get('Martes')}, Mi:{med.get('Miercoles')}, "
                       f"Ju:{med.get('Jueves')}, Vi:{med.get('Viernes')}, Sa:{med.get('Sabado')}, Do:{med.get('Domingo')}}}")
@@ -440,7 +478,7 @@ def reminder_scheduler():
         time.sleep(CHECK_INTERVAL_S)
 
 # -----------------------------------------------------------------------------
-# Lanzar threads
+# Lanzar threads y bucle principal
 # -----------------------------------------------------------------------------
 
 def mcp_worker_thread():
@@ -452,7 +490,6 @@ def sched_threads():
     threading.Thread(target=reminder_scheduler, daemon=True).start()
 
 def self_test_reminder():
-    """Opcional: dispara una prueba al arrancar para verificar audio."""
     if not TEST_REMINDER_ON_START:
         return
     fake_med = {
@@ -467,18 +504,14 @@ def self_test_reminder():
     print("[TEST] Lanzando recordatorio de prueba…")
     _play_reminder_via_backend(fake_med, fake_med["HoraToma"])
 
-# -----------------------------------------------------------------------------
-# Bucle principal (wake word + VAD)
-# -----------------------------------------------------------------------------
-
 def main():
     global state, last_followup_sent_at
 
-    # 1) Threads
     mcp_worker_thread()
     sched_threads()
     self_test_reminder()
 
+    print("[INFO] Playback ALSA device:", ALSA_PLAYBACK_DEVICE)
     print("Listening for wake word...")
 
     while True:
@@ -492,12 +525,12 @@ def main():
         pcm_unpacked = struct.unpack_from("h" * (len(pcm)//2), pcm)
 
         if state == IDLE:
-            keyword_index = porcupine.process(pcm_unpacked)
+            keyword_index = pvporcupine.Porcupine.process(porcupine, pcm_unpacked)
             if keyword_index >= 0:
                 print("[DETECTED] Wake word")
                 frames, dur = record_utterance_vad(prebuffer=pre_buffer_frames)
                 print(f"[REC] wake dur={dur:.2f}s frames={len(frames)}")
-                save_audio_from_frames("wake_audio.wav", frames, SAMPLE_RATE)
+                save_audio_from_frames("wake_audio.wav", frames, RATE)
                 print("[REC] archivo= wake_audio.wav; subiendo…")
                 QUEUE.put(("wake_audio.wav", True))
 
@@ -508,7 +541,7 @@ def main():
             frames, dur = wait_for_speech_then_record_vad(timeout_s=FOLLOWUP_LISTEN_WINDOW_S)
             if frames:
                 print(f"[REC] follow-up dur={dur:.2f}s frames={len(frames)}")
-                save_audio_from_frames("followup.wav", frames, SAMPLE_RATE)
+                save_audio_from_frames("followup.wav", frames, RATE)
                 print("[REC] archivo= followup.wav; subiendo…")
                 QUEUE.put(("followup.wav", True))
                 last_followup_sent_at = time.time()
@@ -517,6 +550,9 @@ def main():
 
 if __name__ == "_main_":
     try:
+        # Evita que ALSA intente usar JACK
+        os.environ.setdefault("ALSA_CARD", "0")
+        os.environ.setdefault("AUDIODEV", ALSA_PLAYBACK_DEVICE or "default")
         main()
     except KeyboardInterrupt:
         print("\nShutting down...")
@@ -526,7 +562,10 @@ if __name__ == "_main_":
             stream.close()
         except Exception:
             pass
-        pa.terminate()
+        try:
+            pa.terminate()
+        except Exception:
+            pass
         try:
             porcupine.delete()
         except Exception:
